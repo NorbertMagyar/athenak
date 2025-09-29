@@ -113,6 +113,14 @@ RefinementCriteria::RefinementCriteria(Mesh *pm, ParameterInput *pin) :
 RefinementCriteria::~RefinementCriteria() {
 }
 
+static inline bool IsMhdDerivedVar(const std::string& v) {
+  return
+    v == "mhd_jz"         || v == "mhd_j2"       ||
+    v == "mhd_curv"       || v == "mhd_k_jxb"    ||
+    v == "mhd_curv_perp"  || v == "mhd_bmag"     ||
+    v == "mhd_divb"       || v == "mhd_jcon";
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn void RefinementCriteria::SetRefinementData()
 //! \brief Cycles through all criteria and load data
@@ -149,6 +157,21 @@ void RefinementCriteria::SetRefinementData(MeshBlockPack* pmbp, bool count_deriv
           int n = static_cast<int>(IDN);
           it->rdata = Kokkos::subview(pmbp->pmhd->w0, ALL, n, ALL, ALL, ALL);
         }
+      } else if (it->rvariable.compare("mhd_w_vx") == 0) {
+  	if (!(count_derived) && !(load_derived)) {
+    	  int n = static_cast<int>(IVX);
+    	  it->rdata = Kokkos::subview(pmbp->pmhd->w0, Kokkos::ALL(), n, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL());
+        }
+      } else if (it->rvariable.compare("mhd_w_vy") == 0) {
+  	if (!(count_derived) && !(load_derived)) {
+          int n = static_cast<int>(IVY);
+          it->rdata = Kokkos::subview(pmbp->pmhd->w0, Kokkos::ALL(), n, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL());
+        }
+      } else if (it->rvariable.compare("mhd_w_vz") == 0) {
+  	if (!(count_derived) && !(load_derived)) {
+          int n = static_cast<int>(IVZ);
+          it->rdata = Kokkos::subview(pmbp->pmhd->w0, Kokkos::ALL(), n, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL());
+        }
       // radiation coordinate frame energy density R^0^0
       } else if (it->rvariable.compare("rad_coord_e") == 0) {
         if (count_derived) {
@@ -157,6 +180,18 @@ void RefinementCriteria::SetRefinementData(MeshBlockPack* pmbp, bool count_deriv
           ComputeDerivedVariable(it->rvariable, iderived, pmbp, dvars);
           iderived += 1;
         } else {
+          it->rdata = Kokkos::subview(dvars, ALL, iderived, ALL, ALL, ALL);
+          iderived += 1;
+        }
+      } else if (IsMhdDerivedVar(it->rvariable)) {
+        if (count_derived) {
+          nderived += 1;
+        } else if (load_derived) {
+          // compute once into dvars[*, iderived, ...]
+          ComputeDerivedVariable(it->rvariable, iderived, pmbp, dvars);
+          iderived += 1;
+        } else {
+          // hand back a view onto the cached derived
           it->rdata = Kokkos::subview(dvars, ALL, iderived, ALL, ALL, ALL);
           iderived += 1;
         }

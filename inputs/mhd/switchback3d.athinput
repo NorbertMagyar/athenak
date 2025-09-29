@@ -1,0 +1,78 @@
+# 3D switchback (exact field), GPU-friendly blocks
+
+<job>
+basename   = Switchback3D_128
+
+<mesh>
+nghost     = 2
+nx1        = 64
+x1min      = -1
+x1max      =  1
+ix1_bc     = periodic
+ox1_bc     = periodic
+
+nx2        = 64
+x2min      = -1
+x2max      =  1
+ix2_bc     = periodic
+ox2_bc     = periodic
+
+nx3        = 64
+x3min      = -1
+x3max      =  1
+ix3_bc     = periodic
+ox3_bc     = periodic
+
+<meshblock>
+nx1        = 8
+nx2        = 8
+nx3        = 8
+
+
+<mesh_refinement>
+refinement       = adaptive    # type of refinement
+max_nmb_per_rank = 1024
+num_levels       = 2
+
+<amr_criterion1>
+method    = min_max
+variable  = mhd_w_vz
+value_min = -0.01
+value_max = 0.01
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.5
+dt_min     = 1.0e-8
+tlim       = 1
+ndiag      = 10
+
+<mhd>
+eos         = ideal
+reconstruct = plm
+rsolver     = hlld
+gamma       = 1.666666667
+
+<problem>
+pgen_name   = switchback3d
+rho0        = 1.0
+p0          = 0.1
+a           = 0.25
+b           = 0.1
+eps         = 0.002
+sign_z      = -1
+
+<output1>
+file_type   = hst
+dt          = 0.10
+
+<output2>
+file_type   = bin
+variable    = mhd_w_bcc
+dt          = 0.10
+
+<output3>
+file_type   = bin
+variable    = mhd_divb
+dt          = 0.10
