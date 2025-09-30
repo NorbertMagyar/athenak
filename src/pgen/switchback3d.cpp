@@ -24,33 +24,38 @@ Real S_fun(Real r, Real b){ Real b2=b*b, r2=r*r; Real denom=b2+r2; Real denom3=d
 KOKKOS_INLINE_FUNCTION
 Real F_fun(Real r, Real b){ Real b2=b*b, r2=r*r; Real denom=b2+r2; Real denom2=denom*denom; return (denom2>0.0)? ((r2*r)/denom2) : 0.0; }
 
-// B_r, B_z, B_phi at (r,z) from your recipe
+// Stable 1 - Br^2 - Bz^2: (1 - Bz)*(1 + Bz) - Br^2
 KOKKOS_INLINE_FUNCTION
-void Br_Bz_Bphi(Real r, Real z, Real a, Real b, Real eps, Real &Br, Real &Bz, Real &Bphi){
+void Br_Bz_Bphi(Real r, Real z, Real a, Real b, Real eps,
+                Real &Br, Real &Bz, Real &Bphi) {
   const Real G  = G_fun(z,a);
   const Real Gp = Gp_fun(z,a);
   const Real S  = S_fun(r,b);
   const Real F  = F_fun(r,b);
+
   Br = eps * F * Gp;
   Bz = 1.0 - eps * S * G;
-  // guard sqrt and r=0
-  Real rad = 1.0 - Br*Br - Bz*Bz;
+
+  Real rad = (1.0 - Bz)*(1.0 + Bz) - Br*Br;  // better-conditioned than 1 - Br^2 - Bz^2
   if (rad < 0.0) rad = 0.0;
-  if (r <= 1e-14) { Bphi = 0.0; return; }
-  Bphi = (z>0? 1.0 : (z<0? -1.0 : 0.0)) * r * sqrt( rad / fmax(r*r, 1e-28) );
+  Bphi = (z > 0 ? 1.0 : (z < 0 ? -1.0 : 0.0)) * std::sqrt(rad);
 }
 
-// 8-point Gauss-Legendre (hardcoded) on [0,1]
-KOKKOS_INLINE_FUNCTION
-Real gl8_absc(int i){
-  const Real x[8] = {0.09501250983763744, 0.2816035507792589, 0.4580167776572274, 0.6178762444026438,
-                     0.7554044083550030, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499};
+// 16-pt Gauss–Legendre on [0,1], weights sum to 1
+KOKKOS_INLINE_FUNCTION Real gl16_x(int i){
+  const Real x[16] = {
+    0.0483076656877383, 0.1444719615827965, 0.2392873622521371, 0.3318686022821277,
+    0.4213512761306353, 0.5068999089322294, 0.5877157572407623, 0.6630442669302152,
+    0.7321821187402897, 0.7944837959679424, 0.8493676137325700, 0.8963211557660521,
+    0.9349060759377397, 0.9647622555875064, 0.9856115115452684, 0.9972638618494816 };
   return x[i];
 }
-KOKKOS_INLINE_FUNCTION
-Real gl8_w(int i){
-  const Real w[8] = {0.1894506104550685, 0.1826034150449236, 0.1691565193950025, 0.1495959888165767,
-                     0.1246289712555339, 0.09515851168249278,0.06225352393864789,0.02715245941175409};
+KOKKOS_INLINE_FUNCTION Real gl16_w(int i){
+  const Real w[16] = {
+    0.0965400885147278, 0.0956387200792749, 0.0938443990808046, 0.0911738786957639,
+    0.0876520930044038, 0.0833119242269467, 0.0781938957870703, 0.0723457941088485,
+    0.0658222227763618, 0.0586840934785355, 0.0509980592623762, 0.0428358980222267,
+    0.0342738629130214, 0.0253920653092621, 0.0162743947309057, 0.0070186100094701 };
   return w[i];
 }
 
@@ -60,20 +65,17 @@ Real Aphi_fun(Real r, Real z, Real a, Real b, Real eps){
   // Aphi = -eps F(r) G(z) + r/2
   return -eps * F_fun(r,b) * G_fun(z,a) + 0.5*r;
 }
+
 KOKKOS_INLINE_FUNCTION
 Real Az_fun(Real r, Real z, Real a, Real b, Real eps){
   if (r <= 1e-14) return 0.0;
   Real acc = 0.0;
-  // map [0,1] -> [0,r]
-  for (int q=0;q<8;++q){
-    Real xi = gl8_absc(q);
-    Real w  = gl8_w(q);
-    Real rho = 0.5*r*(1.0 + xi);
-    Real Br,Bz,Bphi; Br_Bz_Bphi(rho, z, a,b,eps, Br,Bz,Bphi);
-    acc += w * Bphi;
+  for (int q=0; q<16; ++q){
+    const Real rho = r * gl16_x(q);             // map [0,1] → [0,r]
+    Real Br,Bz,Bphi; Br_Bz_Bphi(rho,z,a,b,eps,Br,Bz,Bphi);
+    acc += gl16_w(q) * Bphi;
   }
-  // GL on [0,1] with map => integral ≈ (r/2) * sum w * Bphi(ρ)
-  return -0.5*r * acc;
+  return -r * acc;                               // ∫_0^r ≈ r Σ w_i f(r x_i)
 }
 
 // Cartesian A at arbitrary (x,y,z)
@@ -230,26 +232,22 @@ void ProblemGenerator::Switchback3D(ParameterInput *pin, const bool restart) {
   //     v = signz * (B_c - e_z)/sqrt(rho0),  μ0=1
   //     (B_c from face-averaged CT fields)
   // ---------------------------------------------
+  // v = signz * (B_c - e_z)/sqrt(rho0)
   const Real vfac = static_cast<Real>(signz) / std::sqrt(rho0);
-
-  par_for("pgen_sbu0_from_faces", DevExeSpace(),
-        0,(pmbp->nmb_thispack-1), ks,ke, js,je, is,ie,
+  par_for("pgen_sbu0_from_faces", DevExeSpace(), 0,(pmbp->nmb_thispack-1), ks,ke, js,je, is,ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real Bcx = 0.5*(b0.x1f(m,k,j,i) + b0.x1f(m,k,j,i+1));
+    const Real Bcy = 0.5*(b0.x2f(m,k,j,i) + b0.x2f(m,k,j+1,i));
+    const Real Bcz = 0.5*(b0.x3f(m,k,j,i) + b0.x3f(m,k+1,j,i));
 
-  // CT-consistent cell-centered B
-  const Real Bcx = 0.5*(b0.x1f(m,k,j,i) + b0.x1f(m,k,j,i+1));
-  const Real Bcy = 0.5*(b0.x2f(m,k,j,i) + b0.x2f(m,k,j+1,i));
-  const Real Bcz = 0.5*(b0.x3f(m,k,j,i) + b0.x3f(m,k+1,j,i));
+    const Real vx = vfac * ( Bcx      );
+    const Real vy = vfac * ( Bcy      );
+    const Real vz = vfac * ( Bcz - 1.0);
 
-  // z^± Elsässer velocity (z^- if signz = -1)
-  const Real vx = vfac * ( Bcx      );   // dBx = Bx - 0
-  const Real vy = vfac * ( Bcy      );
-  const Real vz = vfac * ( Bcz - 1.0);
-
-  u0(m,IDN,k,j,i) = rho0;
-  u0(m,IM1,k,j,i) = rho0 * vx;
-  u0(m,IM2,k,j,i) = rho0 * vy;
-  u0(m,IM3,k,j,i) = rho0 * vz;
+    u0(m,IDN,k,j,i) = rho0;
+    u0(m,IM1,k,j,i) = rho0 * vx;
+    u0(m,IM2,k,j,i) = rho0 * vy;
+    u0(m,IM3,k,j,i) = rho0 * vz;
   });
 
   // 3) Total energy = p/(γ-1) + ½ρv² + ½|B|² (B from face-averages)

@@ -6,39 +6,40 @@ basename   = Switchback3D_128
 <mesh>
 nghost     = 2
 nx1        = 64
-x1min      = -1
-x1max      =  1
+x1min      = -2
+x1max      =  2
 ix1_bc     = periodic
 ox1_bc     = periodic
 
 nx2        = 64
-x2min      = -1
-x2max      =  1
+x2min      = -2
+x2max      =  2
 ix2_bc     = periodic
 ox2_bc     = periodic
 
 nx3        = 64
-x3min      = -1
-x3max      =  1
+x3min      = -2
+x3max      =  2
 ix3_bc     = periodic
 ox3_bc     = periodic
 
 <meshblock>
-nx1        = 8
-nx2        = 8
-nx3        = 8
+nx1        = 16
+nx2        = 16
+nx3        = 16
 
 
 <mesh_refinement>
 refinement       = adaptive    # type of refinement
-max_nmb_per_rank = 1024
-num_levels       = 2
+refinement_interval = 1
+max_nmb_per_rank = 500
+num_levels       = 1
 
 <amr_criterion1>
 method    = min_max
-variable  = mhd_w_vz
-value_min = -0.01
-value_max = 0.01
+variable  = mhd_w_vx
+value_min = -0.05
+value_max = 0.05
 
 <time>
 evolution  = dynamic
@@ -70,9 +71,11 @@ dt          = 0.10
 <output2>
 file_type   = bin
 variable    = mhd_w_bcc
-dt          = 0.10
+dt          = 0.05
+slice_x2    = 0.0
 
-<output3>
-file_type   = bin
-variable    = mhd_divb
-dt          = 0.10
+#<output3>
+#file_type   = bin
+#variable    = mhd_divb
+#dt          = 0.10
+#slice_x2    = 0.0
