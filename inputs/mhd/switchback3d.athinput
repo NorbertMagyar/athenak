@@ -5,15 +5,15 @@ basename   = Switchback3D_128
 
 <mesh>
 nghost     = 2
-nx1        = 64
-x1min      = -2
-x1max      =  2
+nx1        = 96
+x1min      = -3
+x1max      =  3
 ix1_bc     = periodic
 ox1_bc     = periodic
 
-nx2        = 64
-x2min      = -2
-x2max      =  2
+nx2        = 96
+x2min      = -3
+x2max      =  3
 ix2_bc     = periodic
 ox2_bc     = periodic
 
@@ -31,8 +31,8 @@ nx3        = 16
 
 <mesh_refinement>
 refinement       = adaptive #type of refinement
-max_nmb_per_rank = 1024
-num_levels       = 2
+max_nmb_per_rank = 512
+num_levels       = 3
 preloop_refine   = 1
 preloop_max_iters = 4
 
@@ -47,8 +47,8 @@ evolution  = dynamic
 integrator = rk2
 cfl_number = 0.5
 dt_min     = 1.0e-8
-tlim       = 1
-ndiag      = 10
+tlim       = 10
+ndiag      = 1
 
 <mhd>
 eos         = ideal
