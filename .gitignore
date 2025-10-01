@@ -17,3 +17,9 @@ build*/
 *~
 *.swp
 Lorene
+
+CMakeCache.txt
+CMakeFiles/
+tst/test_log.txt
+tst/test_suite/__pycache__/
+vis/python/__pycache__/

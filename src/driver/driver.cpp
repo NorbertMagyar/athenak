@@ -313,6 +313,44 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
 
+  // Optional t=0 adaptive refinement pass before outputs so ICs are generated on final mesh
+  if (pmesh->adaptive && (pmesh->pmr != nullptr) && (pmesh->pgen != nullptr)
+      && (pmesh->time == 0.0)) {
+    const bool preloop_refine = pin->GetOrAddBoolean("mesh_refinement", "preloop_refine",
+                                                    false);
+    if (preloop_refine) {
+      int max_iters = pin->GetOrAddInteger("mesh_refinement", "preloop_max_iters", 1);
+      max_iters = std::max(1, max_iters);
+
+      MeshRefinement *pmr = pmesh->pmr;
+      const int saved_interval = pmr->refinement_interval;
+      const int saved_check = pmr->ncyc_check_amr;
+      pmr->refinement_interval = 0;
+      pmr->ncyc_check_amr = 1;
+
+      int iter = 0;
+      bool changed = false;
+      do {
+        const int created_before = pmr->nmb_created;
+        const int deleted_before = pmr->nmb_deleted;
+        pmr->AdaptiveMeshRefinement(this, pin);
+        const bool local_change = (pmr->nmb_created != created_before) ||
+                                  (pmr->nmb_deleted != deleted_before);
+        changed = local_change;
+        ++iter;
+      } while (changed && (iter < max_iters));
+
+      pmr->refinement_interval = saved_interval;
+      pmr->ncyc_check_amr = saved_check;
+
+      // Recompute ICs on the refined hierarchy
+      pmesh->pgen->CallProblemGenerator(pin, false);
+
+      // Refreshed data requires boundary/primitive setup on the new hierarchy
+      InitBoundaryValuesAndPrimitives(pmesh);
+    }
+  }
+
   //---- Step 2.  Compute time step (if problem involves time evolution)
   hydro::Hydro *phydro = pmesh->pmb_pack->phydro;
   mhd::MHD *pmhd = pmesh->pmb_pack->pmhd;

@@ -30,16 +30,17 @@ nx3        = 16
 
 
 <mesh_refinement>
-refinement       = adaptive    # type of refinement
-refinement_interval = 1
-max_nmb_per_rank = 500
-num_levels       = 1
+refinement       = adaptive #type of refinement
+max_nmb_per_rank = 1024
+num_levels       = 2
+preloop_refine   = 1
+preloop_max_iters = 4
 
 <amr_criterion1>
 method    = min_max
-variable  = mhd_w_vx
-value_min = -0.05
-value_max = 0.05
+variable  = mhd_w_vy
+value_min = -0.02
+value_max = 0.02
 
 <time>
 evolution  = dynamic
@@ -74,8 +75,8 @@ variable    = mhd_w_bcc
 dt          = 0.05
 slice_x2    = 0.0
 
-#<output3>
-#file_type   = bin
-#variable    = mhd_divb
-#dt          = 0.10
-#slice_x2    = 0.0
+<output3>
+file_type   = bin
+variable    = mhd_divb
+dt          = 0.10
+slice_x2    = 0.0
