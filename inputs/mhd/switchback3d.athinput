@@ -31,8 +31,8 @@ nx3        = 16
 
 <mesh_refinement>
 refinement       = adaptive #type of refinement
-max_nmb_per_rank = 512
-num_levels       = 3
+max_nmb_per_rank = 10000
+num_levels       = 5
 preloop_refine   = 1
 preloop_max_iters = 4
 
@@ -47,8 +47,8 @@ evolution  = dynamic
 integrator = rk2
 cfl_number = 0.5
 dt_min     = 1.0e-8
-tlim       = 10
-ndiag      = 1
+tlim       = 100
+ndiag      = 10
 
 <mhd>
 eos         = ideal
@@ -72,11 +72,11 @@ dt          = 0.10
 <output2>
 file_type   = bin
 variable    = mhd_w_bcc
-dt          = 0.05
+dt          = 0.25
 slice_x2    = 0.0
+file_number = 201	
 
 <output3>
-file_type   = bin
-variable    = mhd_divb
-dt          = 0.10
-slice_x2    = 0.0
+file_type   = rst
+dt          = 5
+file_number = 11
