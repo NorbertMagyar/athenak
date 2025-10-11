@@ -5,23 +5,23 @@ basename   = Switchback3D_128
 
 <mesh>
 nghost     = 2
-nx1        = 96
-x1min      = -3
-x1max      =  3
-ix1_bc     = periodic
-ox1_bc     = periodic
+nx1        = 128
+x1min      = -2
+x1max      =  2
+ix1_bc     = outflow
+ox1_bc     = outflow
 
-nx2        = 96
-x2min      = -3
-x2max      =  3
-ix2_bc     = periodic
-ox2_bc     = periodic
+nx2        = 128
+x2min      = -2
+x2max      =  2
+ix2_bc     = outflow
+ox2_bc     = outflow
 
-nx3        = 64
+nx3        = 128
 x3min      = -2
-x3max      =  2
-ix3_bc     = periodic
-ox3_bc     = periodic
+x3max      = 2
+ix3_bc     = user
+ox3_bc     = user
 
 <meshblock>
 nx1        = 16
@@ -31,10 +31,10 @@ nx3        = 16
 
 <mesh_refinement>
 refinement       = adaptive #type of refinement
-max_nmb_per_rank = 10000
-num_levels       = 5
-preloop_refine   = 1
-preloop_max_iters = 4
+max_nmb_per_rank = 512
+num_levels       = 1
+#preloop_refine   = 1
+#preloop_max_iters = 4
 
 <amr_criterion1>
 method    = min_max
@@ -47,7 +47,7 @@ evolution  = dynamic
 integrator = rk2
 cfl_number = 0.5
 dt_min     = 1.0e-8
-tlim       = 100
+tlim       = 0
 ndiag      = 10
 
 <mhd>
@@ -58,12 +58,28 @@ gamma       = 1.666666667
 
 <problem>
 pgen_name   = switchback3d
-rho0        = 1.0
-p0          = 0.1
-a           = 0.25
-b           = 0.1
-eps         = 0.002
-sign_z      = -1
+rho0 = 1.0
+temperature = 1.0
+surface_gravity = -274.0
+R_sun = 6.957e8
+mu = 0.62
+density_unit = 1.0e-12
+temperature_unit = 1.0e6
+length_unit = 1.0e6
+a    = 0.25
+b    = 0.25
+eps  = 0.25
+sign_z = -1
+
+B0   = 5.0
+r0   = 200.0
+gamma= 0
+kD   = 0.0
+kQ   = 0.0
+
+x0 = 0.0
+y0 = 0.0
+z0 = -200.0
 
 <output1>
 file_type   = hst
@@ -71,12 +87,13 @@ dt          = 0.10
 
 <output2>
 file_type   = bin
-variable    = mhd_w_bcc
+variable    = mhd_divb
 dt          = 0.25
-slice_x2    = 0.0
-file_number = 201	
+#slice_x2    = 0.0	
+file_number = 0
 
 <output3>
-file_type   = rst
+file_type   = bin
+variable    = mhd_w_bcc
 dt          = 5
-file_number = 11
+file_number = ö
