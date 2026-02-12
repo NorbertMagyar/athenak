@@ -675,3 +675,12 @@ void Mesh::AddCoordinatesAndPhysics(ParameterInput *pinput) {
     pmr->pmrc = new RefinementCriteria(this, pinput);
   }
 }
+
+int Mesh::FindMeshBlockIndex(int tgid) {
+  for (int m = 0; m < pmb_pack->nmb_thispack; ++m) {
+    if (pmb_pack->pmb->mb_gid.h_view(m) == tgid) {
+      return m;
+    }
+  }
+  return -1;
+}

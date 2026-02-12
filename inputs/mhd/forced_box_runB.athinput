@@ -1,0 +1,81 @@
+# AthenaK input for transversely structured driven MHD turbulence (run B)
+
+<comment>
+problem = mhd_forced_box run B (density corrugations in x/y)
+
+<job>
+basename = forcedB
+
+<mesh>
+nghost = 2
+nx1    = 256
+x1min  = 0.0
+x1max  = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2    = 256
+x2min  = 0.0
+x2max  = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3    = 256
+x3min  = 0.0
+x3max  = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 64
+nx2 = 64
+nx3 = 64
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = -1
+tlim       = 10.0
+ndiag      = 1
+
+<mhd>
+eos               = ideal
+gamma             = 1.6666666666667
+reconstruct       = plm
+rsolver           = hlld
+viscosity         = 1.0e-3
+ohmic_resistivity = 1.0e-3
+
+<problem>
+rho0                = 1.0
+beta                = 0.1
+p0                  = -1.0
+B0                  = 1.0
+density_variations  = true
+density_eps         = 0.2
+
+<turb_driving>
+type                = mhd
+nlow                = 1
+nhigh               = 2
+tcorr               = 0.5
+dedt                = 0.05
+control             = power
+accel_rms           = 0.1
+solenoidal_fraction = 0.9
+seed                = 1349      # identical forcing between runs
+
+<output1>
+file_type = hst
+dt        = 0.05
+
+<output2>
+file_type = vtk
+dt        = 0.5
+variable  = mhd_w
+
+<output3>
+file_type = vtk
+dt        = 1.0
+variable  = turb_force
