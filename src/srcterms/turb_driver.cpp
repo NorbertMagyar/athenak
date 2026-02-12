@@ -7,9 +7,12 @@
 //  \brief implementation of functions in TurbulenceDriver
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "athena.hpp"
 #include "parameter_input.hpp"
@@ -32,6 +35,12 @@ TurbulenceDriver::TurbulenceDriver(MeshBlockPack *pp, ParameterInput *pin) :
   pmy_pack(pp),
   force("force",1,1,1,1,1),
   force_tmp("force_tmp",1,1,1,1,1),
+  force_plus("force_plus",1,1,1,1,1),
+  force_minus("force_minus",1,1,1,1,1),
+  force_plus_tmp("force_plus_tmp",1,1,1,1,1),
+  force_minus_tmp("force_minus_tmp",1,1,1,1,1),
+  bdrive("bdrive",1,1,1,1,1),
+  emf_drive("emf_drive",1,1,1,1),
   xccc("xccc",1),xccs("xccs",1),xcsc("xcsc",1),xcss("xcss",1),
   xscc("xscc",1),xscs("xscs",1),xssc("xssc",1),xsss("xsss",1),
   yccc("yccc",1),yccs("yccs",1),ycsc("ycsc",1),ycss("ycss",1),
@@ -40,7 +49,18 @@ TurbulenceDriver::TurbulenceDriver(MeshBlockPack *pp, ParameterInput *pin) :
   zscc("zscc",1),zscs("zscs",1),zssc("zssc",1),zsss("zsss",1),
   kx_mode("kx_mode",1),ky_mode("ky_mode",1),kz_mode("kz_mode",1),
   xcos("xcos",1,1,1),xsin("xsin",1,1,1),ycos("ycos",1,1,1),
-  ysin("ysin",1,1,1),zcos("zcos",1,1,1),zsin("zsin",1,1,1) {
+  ysin("ysin",1,1,1),zcos("zcos",1,1,1),zsin("zsin",1,1,1),
+  xcos_edge("xcos_edge",1,1,1),xsin_edge("xsin_edge",1,1,1),
+  ycos_edge("ycos_edge",1,1,1),ysin_edge("ysin_edge",1,1,1),
+  psiccc("psiccc",1),psiccs("psiccs",1),psicsc("psicsc",1),psicss("psicss",1),
+  psiscc("psiscc",1),psiscs("psiscs",1),psissc("psissc",1),psisss("psisss",1),
+  bxccc("bxccc",1),bxccs("bxccs",1),bxcsc("bxcsc",1),bxcss("bxcss",1),
+  bxscc("bxscc",1),bxscs("bxscs",1),bxssc("bxssc",1),bxsss("bxsss",1),
+  byccc("byccc",1),byccs("byccs",1),bycsc("bycsc",1),bycss("bycss",1),
+  byscc("byscc",1),byscs("byscs",1),byssc("byssc",1),bysss("bysss",1),
+  norm_ccc("norm_ccc",1),norm_ccs("norm_ccs",1),norm_csc("norm_csc",1),
+  norm_css("norm_css",1),norm_scc("norm_scc",1),norm_scs("norm_scs",1),
+  norm_ssc("norm_ssc",1),norm_sss("norm_sss",1) {
   // allocate memory for force registers
   int nmb = pmy_pack->nmb_thispack;
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -50,7 +70,14 @@ TurbulenceDriver::TurbulenceDriver(MeshBlockPack *pp, ParameterInput *pin) :
 
   Kokkos::realloc(force, nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::realloc(force_tmp, nmb, 3, ncells3, ncells2, ncells1);
-
+  Kokkos::realloc(force_plus, nmb, 3, ncells3, ncells2, ncells1);
+  Kokkos::realloc(force_minus, nmb, 3, ncells3, ncells2, ncells1);
+  Kokkos::realloc(force_plus_tmp, nmb, 3, ncells3, ncells2, ncells1);
+  Kokkos::realloc(force_minus_tmp, nmb, 3, ncells3, ncells2, ncells1);
+  Kokkos::realloc(bdrive, nmb, 2, ncells3, ncells2, ncells1);
+  Kokkos::realloc(emf_drive.x1e, nmb, ncells3+1, ncells2+1, ncells1);
+  Kokkos::realloc(emf_drive.x2e, nmb, ncells3+1, ncells2, ncells1+1);
+  Kokkos::realloc(emf_drive.x3e, nmb, ncells3, ncells2+1, ncells1+1);
   // range of modes including, corresponding to kmin and kmax
   nlow = pin->GetOrAddInteger("turb_driving", "nlow", 1);
   nhigh = pin->GetOrAddInteger("turb_driving", "nhigh", 2);
@@ -64,6 +91,22 @@ TurbulenceDriver::TurbulenceDriver(MeshBlockPack *pp, ParameterInput *pin) :
   dedt = pin->GetOrAddReal("turb_driving", "dedt", 0.0);
   // correlation time
   tcorr = pin->GetOrAddReal("turb_driving", "tcorr", 0.0);
+  std::string ctrl = pin->GetOrAddString("turb_driving", "control", "power");
+  if (ctrl == "accel" || ctrl == "acceleration" || ctrl == "amplitude") {
+    control_mode = ForceControl::kAccel;
+  } else {
+    control_mode = ForceControl::kPower;
+  }
+  accel_rms = pin->GetOrAddReal("turb_driving", "accel_rms", 0.1);
+  zplus_fraction = pin->GetOrAddReal("turb_driving", "zplus_fraction", 0.5);
+  if (zplus_fraction < 0.0) zplus_fraction = 0.0;
+  if (zplus_fraction > 1.0) zplus_fraction = 1.0;
+  alfvenic_drive = pin->GetOrAddBoolean("turb_driving", "alfvenic_drive", false);
+  force_perp_only = pin->GetOrAddBoolean("turb_driving", "force_perp_only", false);
+  if (alfvenic_drive) force_perp_only = true;
+  alfvenic_rho0 = pin->GetOrAddReal("turb_driving", "alfvenic_rho0", 1.0);
+  if (alfvenic_rho0 <= 0.0) alfvenic_rho0 = 1.0;
+  alfvenic_sqrt_rho0 = std::sqrt(alfvenic_rho0);
 
   Real nlow_sqr = nlow*nlow;
   Real nhigh_sqr = nhigh*nhigh;
@@ -133,6 +176,42 @@ TurbulenceDriver::TurbulenceDriver(MeshBlockPack *pp, ParameterInput *pin) :
   Kokkos::realloc(ysin, nmb, mode_count, ncells2);
   Kokkos::realloc(zcos, nmb, mode_count, ncells3);
   Kokkos::realloc(zsin, nmb, mode_count, ncells3);
+  Kokkos::realloc(xcos_edge, nmb, mode_count, ncells1+1);
+  Kokkos::realloc(xsin_edge, nmb, mode_count, ncells1+1);
+  Kokkos::realloc(ycos_edge, nmb, mode_count, std::max(1, ncells2+1));
+  Kokkos::realloc(ysin_edge, nmb, mode_count, std::max(1, ncells2+1));
+  Kokkos::realloc(psiccc, mode_count);
+  Kokkos::realloc(psiccs, mode_count);
+  Kokkos::realloc(psicsc, mode_count);
+  Kokkos::realloc(psicss, mode_count);
+  Kokkos::realloc(psiscc, mode_count);
+  Kokkos::realloc(psiscs, mode_count);
+  Kokkos::realloc(psissc, mode_count);
+  Kokkos::realloc(psisss, mode_count);
+  Kokkos::realloc(bxccc, mode_count);
+  Kokkos::realloc(bxccs, mode_count);
+  Kokkos::realloc(bxcsc, mode_count);
+  Kokkos::realloc(bxcss, mode_count);
+  Kokkos::realloc(bxscc, mode_count);
+  Kokkos::realloc(bxscs, mode_count);
+  Kokkos::realloc(bxssc, mode_count);
+  Kokkos::realloc(bxsss, mode_count);
+  Kokkos::realloc(byccc, mode_count);
+  Kokkos::realloc(byccs, mode_count);
+  Kokkos::realloc(bycsc, mode_count);
+  Kokkos::realloc(bycss, mode_count);
+  Kokkos::realloc(byscc, mode_count);
+  Kokkos::realloc(byscs, mode_count);
+  Kokkos::realloc(byssc, mode_count);
+  Kokkos::realloc(bysss, mode_count);
+  Kokkos::realloc(norm_ccc, mode_count);
+  Kokkos::realloc(norm_ccs, mode_count);
+  Kokkos::realloc(norm_csc, mode_count);
+  Kokkos::realloc(norm_css, mode_count);
+  Kokkos::realloc(norm_scc, mode_count);
+  Kokkos::realloc(norm_scs, mode_count);
+  Kokkos::realloc(norm_ssc, mode_count);
+  Kokkos::realloc(norm_sss, mode_count);
 
   Initialize();
 }
@@ -162,10 +241,41 @@ void TurbulenceDriver::Initialize() {
   int &nx3 = indcs.nx3;
 
   auto force_ = force;
+  auto force_tmp_ = force_tmp;
+  auto force_plus_ = force_plus;
+  auto force_minus_ = force_minus;
+  auto force_plus_tmp_ = force_plus_tmp;
+  auto force_minus_tmp_ = force_minus_tmp;
   par_for("force_init_pgen",DevExeSpace(),
           0,nmb-1,0,2,0,ncells3-1,0,ncells2-1,0,ncells1-1,
   KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
     force_(m,n,k,j,i) = 0.0;
+    force_tmp_(m,n,k,j,i) = 0.0;
+    force_plus_(m,n,k,j,i) = 0.0;
+    force_minus_(m,n,k,j,i) = 0.0;
+    force_plus_tmp_(m,n,k,j,i) = 0.0;
+    force_minus_tmp_(m,n,k,j,i) = 0.0;
+  });
+  auto bdrive_ = bdrive;
+  par_for("bdrive_init_pgen",DevExeSpace(),
+          0,nmb-1,0,1,0,ncells3-1,0,ncells2-1,0,ncells1-1,
+  KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+    bdrive_(m,n,k,j,i) = 0.0;
+  });
+  auto emf1_ = emf_drive.x1e;
+  auto emf2_ = emf_drive.x2e;
+  auto emf3_ = emf_drive.x3e;
+  par_for("emf_init_x1", DevExeSpace(), 0, nmb-1, 0, ncells3, 0, ncells2, 0, ncells1-1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    emf1_(m,k,j,i) = 0.0;
+  });
+  par_for("emf_init_x2", DevExeSpace(), 0, nmb-1, 0, ncells3, 0, ncells2-1, 0, ncells1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    emf2_(m,k,j,i) = 0.0;
+  });
+  par_for("emf_init_x3", DevExeSpace(), 0, nmb-1, 0, ncells3-1, 0, ncells2, 0, ncells1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    emf3_(m,k,j,i) = 0.0;
   });
 
   rstate.idum = -1;
@@ -271,9 +381,130 @@ void TurbulenceDriver::Initialize() {
     }
   });
 
+  auto xcos_edge_ = xcos_edge;
+  auto xsin_edge_ = xsin_edge;
+  par_for("xedge_trig", DevExeSpace(),0,nmb-1,0,mode_count-1,is,ie+1,
+  KOKKOS_LAMBDA(int m, int n, int i) {
+    Real &x1min = size.d_view(m).x1min;
+    Real &x1max = size.d_view(m).x1max;
+    Real x1f = LeftEdgeX(i-is, nx1, x1min, x1max);
+    Real k1v = kx_mode_.d_view(n);
+    xsin_edge_(m,n,i) = sin(k1v*x1f);
+    xcos_edge_(m,n,i) = cos(k1v*x1f);
+  });
+
+  auto ycos_edge_ = ycos_edge;
+  auto ysin_edge_ = ysin_edge;
+  par_for("yedge_trig", DevExeSpace(),0,nmb-1,0,mode_count-1,js,je+1,
+  KOKKOS_LAMBDA(int m, int n, int j) {
+    Real &x2min = size.d_view(m).x2min;
+    Real &x2max = size.d_view(m).x2max;
+    Real x2f = LeftEdgeX(j-js, nx2, x2min, x2max);
+    Real k2v = ky_mode_.d_view(n);
+    if (ncells2-1 == 0) {
+      ysin_edge_(m,n,j) = 0.0;
+      ycos_edge_(m,n,j) = 1.0;
+    } else {
+      ysin_edge_(m,n,j) = sin(k2v*x2f);
+      ycos_edge_(m,n,j) = cos(k2v*x2f);
+    }
+  });
+
+  ComputeBasisNorms();
+
   return;
 }
 
+void TurbulenceDriver::ComputeBasisNorms() {
+  auto xcos_ = xcos;
+  auto xsin_ = xsin;
+  auto ycos_ = ycos;
+  auto ysin_ = ysin;
+  auto zcos_ = zcos;
+  auto zsin_ = zsin;
+  auto norm_ccc_ = norm_ccc;
+  auto norm_ccs_ = norm_ccs;
+  auto norm_csc_ = norm_csc;
+  auto norm_css_ = norm_css;
+  auto norm_scc_ = norm_scc;
+  auto norm_scs_ = norm_scs;
+  auto norm_ssc_ = norm_ssc;
+  auto norm_sss_ = norm_sss;
+
+  Kokkos::deep_copy(norm_ccc_.d_view, 0.0);
+  Kokkos::deep_copy(norm_ccs_.d_view, 0.0);
+  Kokkos::deep_copy(norm_csc_.d_view, 0.0);
+  Kokkos::deep_copy(norm_css_.d_view, 0.0);
+  Kokkos::deep_copy(norm_scc_.d_view, 0.0);
+  Kokkos::deep_copy(norm_scs_.d_view, 0.0);
+  Kokkos::deep_copy(norm_ssc_.d_view, 0.0);
+  Kokkos::deep_copy(norm_sss_.d_view, 0.0);
+
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int is = indcs.is, ie = indcs.ie;
+  int js = indcs.js, je = indcs.je;
+  int ks = indcs.ks, ke = indcs.ke;
+  int &nmb = pmy_pack->nmb_thispack;
+
+  int mode_count_ = mode_count;
+  par_for("basis_norms", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    for (int n=0; n<mode_count_; ++n) {
+      Real xc = xcos_(m,n,i);
+      Real xs = xsin_(m,n,i);
+      Real yc = ycos_(m,n,j);
+      Real ys = ysin_(m,n,j);
+      Real zc = zcos_(m,n,k);
+      Real zs = zsin_(m,n,k);
+      Real v;
+
+      v = xc*yc*zc;
+      Kokkos::atomic_add(&(norm_ccc_.d_view(n)), v*v);
+      v = xc*yc*zs;
+      Kokkos::atomic_add(&(norm_ccs_.d_view(n)), v*v);
+      v = xc*ys*zc;
+      Kokkos::atomic_add(&(norm_csc_.d_view(n)), v*v);
+      v = xc*ys*zs;
+      Kokkos::atomic_add(&(norm_css_.d_view(n)), v*v);
+      v = xs*yc*zc;
+      Kokkos::atomic_add(&(norm_scc_.d_view(n)), v*v);
+      v = xs*yc*zs;
+      Kokkos::atomic_add(&(norm_scs_.d_view(n)), v*v);
+      v = xs*ys*zc;
+      Kokkos::atomic_add(&(norm_ssc_.d_view(n)), v*v);
+      v = xs*ys*zs;
+      Kokkos::atomic_add(&(norm_sss_.d_view(n)), v*v);
+    }
+  });
+
+  norm_ccc_.template sync<HostMemSpace>();
+  norm_ccs_.template sync<HostMemSpace>();
+  norm_csc_.template sync<HostMemSpace>();
+  norm_css_.template sync<HostMemSpace>();
+  norm_scc_.template sync<HostMemSpace>();
+  norm_scs_.template sync<HostMemSpace>();
+  norm_ssc_.template sync<HostMemSpace>();
+  norm_sss_.template sync<HostMemSpace>();
+
+#if MPI_PARALLEL_ENABLED
+  auto reduce_norm = [&](DualArray1D<Real> &arr) {
+    std::vector<Real> send(mode_count), recv(mode_count);
+    for (int n=0; n<mode_count; ++n) send[n] = arr.h_view(n);
+    MPI_Allreduce(send.data(), recv.data(), mode_count, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    arr.template modify<HostMemSpace>();
+    for (int n=0; n<mode_count; ++n) arr.h_view(n) = recv[n];
+  };
+  reduce_norm(norm_ccc_);
+  reduce_norm(norm_ccs_);
+  reduce_norm(norm_csc_);
+  reduce_norm(norm_css_);
+  reduce_norm(norm_scc_);
+  reduce_norm(norm_scs_);
+  reduce_norm(norm_ssc_);
+  reduce_norm(norm_sss_);
+#endif
+}
 //----------------------------------------------------------------------------------------
 //! \fn  void IncludeModeEvolutionTasks
 //  \brief Includes task in the operator split task list that constructs new modes with
@@ -792,14 +1023,47 @@ TaskStatus TurbulenceDriver::InitializeModes(Driver *pdrive, int stage) {
   Real m0 = t0, m1 = t1;
   Real dt = pm->dt;
   Real dvol = 1.0/(gnx1*gnx2*gnx3);
-  m0 = 0.5*m0*dvol*dt;
-  m1 = m1*dvol;
-
-  Real s;
-  if (m1 >= 0) {
-    s = -m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
+  Real s = 1.0;
+  if (control_mode == ForceControl::kPower) {
+    m0 = 0.5*m0*dvol*dt;
+    m1 = m1*dvol;
+    if (m0 != 0.0) {
+      if (m1 >= 0) {
+        s = -m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
+      } else {
+        s = m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
+      }
+    } else {
+      s = 0.0;
+    }
   } else {
-    s = m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
+    Real tforce = 0.0;
+    Kokkos::parallel_reduce("force_rms", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+    KOKKOS_LAMBDA(const int &idx, Real &sum_tf) {
+      int m = (idx)/nkji;
+      int k = (idx - m*nkji)/nji;
+      int j = (idx - m*nkji - k*nji)/nx1;
+      int i = (idx - m*nkji - k*nji - j*nx1) + is;
+      k += ks;
+      j += js;
+      Real v1 = force_tmp_(m,0,k,j,i);
+      Real v2 = force_tmp_(m,1,k,j,i);
+      Real v3 = force_tmp_(m,2,k,j,i);
+      sum_tf += v1*v1 + v2*v2 + v3*v3;
+    }, Kokkos::Sum<Real>(tforce));
+#if MPI_PARALLEL_ENABLED
+    Real mt[1], gmt[1];
+    mt[0] = tforce;
+    MPI_Allreduce(mt, gmt, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    tforce = gmt[0];
+#endif
+    Real frms_sq = tforce*dvol;
+    Real accel_target = std::abs(accel_rms);
+    if (frms_sq > 0.0) {
+      s = accel_target/std::sqrt(frms_sq);
+    } else {
+      s = 0.0;
+    }
   }
   if (m0 == 0.0) s = 0.0;
 
@@ -809,6 +1073,29 @@ TaskStatus TurbulenceDriver::InitializeModes(Driver *pdrive, int stage) {
     force_tmp_(m,1,k,j,i) *= s;
     force_tmp_(m,2,k,j,i) *= s;
   });
+
+  if (force_perp_only) {
+    par_for("force_zero_parallel_tmp", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      force_tmp_(m,2,k,j,i) = 0.0;
+    });
+  }
+
+  if (alfvenic_drive) {
+    auto force_plus_tmp_ = force_plus_tmp;
+    auto force_minus_tmp_ = force_minus_tmp;
+    par_for("store_plus_minus_templates", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real fx = force_tmp_(m,0,k,j,i);
+      Real fy = force_tmp_(m,1,k,j,i);
+      force_plus_tmp_(m,0,k,j,i) = fx;
+      force_plus_tmp_(m,1,k,j,i) = fy;
+      force_plus_tmp_(m,2,k,j,i) = 0.0;
+      force_minus_tmp_(m,0,k,j,i) = -fy;
+      force_minus_tmp_(m,1,k,j,i) =  fx;
+      force_minus_tmp_(m,2,k,j,i) = 0.0;
+    });
+  }
 
   return TaskStatus::complete;
 }
@@ -860,15 +1147,66 @@ TaskStatus TurbulenceDriver::AddForcing(Driver *pdrive, int stage) {
     if (pmy_pack->pmhd != nullptr) w0 = (pmy_pack->pmhd->w0);
   }
 
+  const bool need_alfvenic = alfvenic_drive;
+  const Real frac_plus = zplus_fraction;
+  const Real frac_minus = std::max(static_cast<Real>(0.0),
+                                   static_cast<Real>(1.0) - frac_plus);
+  const Real w_plus = std::sqrt(frac_plus);
+  const Real w_minus = std::sqrt(frac_minus);
+  const Real sqrt_rho0 = alfvenic_sqrt_rho0;
   auto force_ = force;
   auto force_tmp_ = force_tmp;
+  auto bdrive_ = bdrive;
+  if (need_alfvenic) {
+    auto force_plus_ = force_plus;
+    auto force_minus_ = force_minus;
+    auto force_plus_tmp_ = force_plus_tmp;
+    auto force_minus_tmp_ = force_minus_tmp;
 
-  par_for("force_OU_process",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    force_(m,0,k,j,i) = fcorr*force_(m,0,k,j,i) + gcorr*force_tmp_(m,0,k,j,i);
-    force_(m,1,k,j,i) = fcorr*force_(m,1,k,j,i) + gcorr*force_tmp_(m,1,k,j,i);
-    force_(m,2,k,j,i) = fcorr*force_(m,2,k,j,i) + gcorr*force_tmp_(m,2,k,j,i);
-  });
+    par_for("force_OU_elsasser",DevExeSpace(),0,nmb-1,0,2,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+      force_plus_(m,n,k,j,i)  = fcorr*force_plus_(m,n,k,j,i)
+                              + gcorr*force_plus_tmp_(m,n,k,j,i);
+      force_minus_(m,n,k,j,i) = fcorr*force_minus_(m,n,k,j,i)
+                              + gcorr*force_minus_tmp_(m,n,k,j,i);
+    });
+
+    par_for("force_from_zpm",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real zp_x = force_plus_(m,0,k,j,i);
+      Real zp_y = force_plus_(m,1,k,j,i);
+      Real zm_x = force_minus_(m,0,k,j,i);
+      Real zm_y = force_minus_(m,1,k,j,i);
+      Real v_fac = 0.5;
+      Real b_fac = 0.5*sqrt_rho0;
+      Real v1 = v_fac*(w_plus*zp_x + w_minus*zm_x);
+      Real v2 = v_fac*(w_plus*zp_y + w_minus*zm_y);
+      force_(m,0,k,j,i) = v1;
+      force_(m,1,k,j,i) = v2;
+      force_(m,2,k,j,i) = 0.0;
+      bdrive_(m,0,k,j,i) = b_fac*(w_plus*zp_x - w_minus*zm_x);
+      bdrive_(m,1,k,j,i) = b_fac*(w_plus*zp_y - w_minus*zm_y);
+    });
+    ComputeMagneticEMF();
+  } else {
+    par_for("force_OU_process",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      force_(m,0,k,j,i) = fcorr*force_(m,0,k,j,i) + gcorr*force_tmp_(m,0,k,j,i);
+      force_(m,1,k,j,i) = fcorr*force_(m,1,k,j,i) + gcorr*force_tmp_(m,1,k,j,i);
+      force_(m,2,k,j,i) = fcorr*force_(m,2,k,j,i) + gcorr*force_tmp_(m,2,k,j,i);
+    });
+    if (force_perp_only) {
+      par_for("force_zero_parallel",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        force_(m,2,k,j,i) = 0.0;
+      });
+    }
+    par_for("bdrive_reset",DevExeSpace(),0,nmb-1,0,1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+      bdrive_(m,n,k,j,i) = 0.0;
+    });
+    emf_ready_ = false;
+  }
 
   par_for("push",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -1213,4 +1551,295 @@ TaskStatus TurbulenceDriver::AddForcing(Driver *pdrive, int stage) {
   }
 
   return TaskStatus::complete;
+}
+
+void TurbulenceDriver::ApplyEMF(DvceEdgeFld4D<Real> &efld) {
+  if (!emf_ready_) return;
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int nmb = pmy_pack->nmb_thispack;
+  int ncells1 = indcs.nx1 + 2*(indcs.ng);
+  int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
+  int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
+  auto emf1 = emf_drive.x1e;
+  auto emf2 = emf_drive.x2e;
+  auto emf3 = emf_drive.x3e;
+  auto e1 = efld.x1e;
+  auto e2 = efld.x2e;
+  auto e3 = efld.x3e;
+
+  par_for("turb_add_emf_x1", DevExeSpace(), 0, nmb-1, 0, ncells3, 0, ncells2, 0, ncells1-1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    e1(m,k,j,i) += emf1(m,k,j,i);
+  });
+  par_for("turb_add_emf_x2", DevExeSpace(), 0, nmb-1, 0, ncells3, 0, ncells2-1, 0, ncells1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    e2(m,k,j,i) += emf2(m,k,j,i);
+  });
+  par_for("turb_add_emf_x3", DevExeSpace(), 0, nmb-1, 0, ncells3-1, 0, ncells2, 0, ncells1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    e3(m,k,j,i) += emf3(m,k,j,i);
+  });
+  emf_ready_ = false;
+}
+
+void TurbulenceDriver::ComputeMagneticEMF() {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int is = indcs.is, ie = indcs.ie;
+  int js = indcs.js, je = indcs.je;
+  int ks = indcs.ks, ke = indcs.ke;
+  int nmb = pmy_pack->nmb_thispack;
+
+  Kokkos::deep_copy(emf_drive.x1e, 0.0);
+  Kokkos::deep_copy(emf_drive.x2e, 0.0);
+  Kokkos::deep_copy(emf_drive.x3e, 0.0);
+
+  if (!alfvenic_drive || mode_count == 0) {
+    emf_ready_ = false;
+    return;
+  }
+
+  auto zero_coeff = [](DualArray1D<Real> &arr) {
+    Kokkos::deep_copy(arr.d_view, 0.0);
+  };
+  zero_coeff(bxccc);
+  zero_coeff(bxccs);
+  zero_coeff(bxcsc);
+  zero_coeff(bxcss);
+  zero_coeff(bxscc);
+  zero_coeff(bxscs);
+  zero_coeff(bxssc);
+  zero_coeff(bxsss);
+  zero_coeff(byccc);
+  zero_coeff(byccs);
+  zero_coeff(bycsc);
+  zero_coeff(bycss);
+  zero_coeff(byscc);
+  zero_coeff(byscs);
+  zero_coeff(byssc);
+  zero_coeff(bysss);
+
+  auto bdrive_ = bdrive;
+  auto xcos_ = xcos;
+  auto xsin_ = xsin;
+  auto ycos_ = ycos;
+  auto ysin_ = ysin;
+  auto zcos_ = zcos;
+  auto zsin_ = zsin;
+  auto bxccc_ = bxccc;
+  auto bxccs_ = bxccs;
+  auto bxcsc_ = bxcsc;
+  auto bxcss_ = bxcss;
+  auto bxscc_ = bxscc;
+  auto bxscs_ = bxscs;
+  auto bxssc_ = bxssc;
+  auto bxsss_ = bxsss;
+  auto byccc_ = byccc;
+  auto byccs_ = byccs;
+  auto bycsc_ = bycsc;
+  auto bycss_ = bycss;
+  auto byscc_ = byscc;
+  auto byscs_ = byscs;
+  auto byssc_ = byssc;
+  auto bysss_ = bysss;
+
+  int mode_count_ = mode_count;
+  par_for("proj_bdrive", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    Real bx = bdrive_(m,0,k,j,i);
+    Real by = bdrive_(m,1,k,j,i);
+    if (bx == 0.0 && by == 0.0) return;
+    for (int n=0; n<mode_count_; ++n) {
+      Real xc = xcos_(m,n,i);
+      Real xs = xsin_(m,n,i);
+      Real yc = ycos_(m,n,j);
+      Real ys = ysin_(m,n,j);
+      Real zc = zcos_(m,n,k);
+      Real zs = zsin_(m,n,k);
+
+      if (bx != 0.0) {
+        Kokkos::atomic_add(&(bxccc_.d_view(n)), bx*xc*yc*zc);
+        Kokkos::atomic_add(&(bxccs_.d_view(n)), bx*xc*yc*zs);
+        Kokkos::atomic_add(&(bxcsc_.d_view(n)), bx*xc*ys*zc);
+        Kokkos::atomic_add(&(bxcss_.d_view(n)), bx*xc*ys*zs);
+        Kokkos::atomic_add(&(bxscc_.d_view(n)), bx*xs*yc*zc);
+        Kokkos::atomic_add(&(bxscs_.d_view(n)), bx*xs*yc*zs);
+        Kokkos::atomic_add(&(bxssc_.d_view(n)), bx*xs*ys*zc);
+        Kokkos::atomic_add(&(bxsss_.d_view(n)), bx*xs*ys*zs);
+      }
+
+      if (by != 0.0) {
+        Kokkos::atomic_add(&(byccc_.d_view(n)), by*xc*yc*zc);
+        Kokkos::atomic_add(&(byccs_.d_view(n)), by*xc*yc*zs);
+        Kokkos::atomic_add(&(bycsc_.d_view(n)), by*xc*ys*zc);
+        Kokkos::atomic_add(&(bycss_.d_view(n)), by*xc*ys*zs);
+        Kokkos::atomic_add(&(byscc_.d_view(n)), by*xs*yc*zc);
+        Kokkos::atomic_add(&(byscs_.d_view(n)), by*xs*yc*zs);
+        Kokkos::atomic_add(&(byssc_.d_view(n)), by*xs*ys*zc);
+        Kokkos::atomic_add(&(bysss_.d_view(n)), by*xs*ys*zs);
+      }
+    }
+  });
+
+  bxccc_.template sync<HostMemSpace>();
+  bxccs_.template sync<HostMemSpace>();
+  bxcsc_.template sync<HostMemSpace>();
+  bxcss_.template sync<HostMemSpace>();
+  bxscc_.template sync<HostMemSpace>();
+  bxscs_.template sync<HostMemSpace>();
+  bxssc_.template sync<HostMemSpace>();
+  bxsss_.template sync<HostMemSpace>();
+  byccc_.template sync<HostMemSpace>();
+  byccs_.template sync<HostMemSpace>();
+  bycsc_.template sync<HostMemSpace>();
+  bycss_.template sync<HostMemSpace>();
+  byscc_.template sync<HostMemSpace>();
+  byscs_.template sync<HostMemSpace>();
+  byssc_.template sync<HostMemSpace>();
+  bysss_.template sync<HostMemSpace>();
+
+  auto gather = [&](DualArray1D<Real> &arr) {
+#if MPI_PARALLEL_ENABLED
+    std::vector<Real> send(mode_count), recv(mode_count);
+    for (int n=0; n<mode_count; ++n) send[n] = arr.h_view(n);
+    MPI_Allreduce(send.data(), recv.data(), mode_count, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    arr.template modify<HostMemSpace>();
+    for (int n=0; n<mode_count; ++n) arr.h_view(n) = recv[n];
+#else
+    (void) arr;
+#endif
+  };
+
+  gather(bxccc_);
+  gather(bxccs_);
+  gather(bxcsc_);
+  gather(bxcss_);
+  gather(bxscc_);
+  gather(bxscs_);
+  gather(bxssc_);
+  gather(bxsss_);
+  gather(byccc_);
+  gather(byccs_);
+  gather(bycsc_);
+  gather(bycss_);
+  gather(byscc_);
+  gather(byscs_);
+  gather(byssc_);
+  gather(bysss_);
+
+  psiccc.template modify<HostMemSpace>();
+  psiccs.template modify<HostMemSpace>();
+  psicsc.template modify<HostMemSpace>();
+  psicss.template modify<HostMemSpace>();
+  psiscc.template modify<HostMemSpace>();
+  psiscs.template modify<HostMemSpace>();
+  psissc.template modify<HostMemSpace>();
+  psisss.template modify<HostMemSpace>();
+
+  for (int n=0; n<mode_count; ++n) {
+    Real kx = kx_mode.h_view(n);
+    Real ky = ky_mode.h_view(n);
+    Real tiny = 1.0e-20;
+
+    auto coeff = [&](DualArray1D<Real> &num, DualArray1D<Real> &norm) -> Real {
+      Real denom = norm.h_view(n);
+      if (denom <= tiny) return 0.0;
+      return num.h_view(n)/denom;
+    };
+
+    Real cy_ccc = coeff(byccc_, norm_ccc);
+    Real cy_ccs = coeff(byccs_, norm_ccs);
+    Real cy_csc = coeff(bycsc_, norm_csc);
+    Real cy_css = coeff(bycss_, norm_css);
+    Real cy_scc = coeff(byscc_, norm_scc);
+    Real cy_scs = coeff(byscs_, norm_scs);
+    Real cy_ssc = coeff(byssc_, norm_ssc);
+    Real cy_sss = coeff(bysss_, norm_sss);
+
+    Real cx_ccc = coeff(bxccc_, norm_ccc);
+    Real cx_ccs = coeff(bxccs_, norm_ccs);
+    Real cx_csc = coeff(bxcsc_, norm_csc);
+    Real cx_css = coeff(bxcss_, norm_css);
+    Real cx_scc = coeff(bxscc_, norm_scc);
+    Real cx_scs = coeff(bxscs_, norm_scs);
+    Real cx_ssc = coeff(bxssc_, norm_ssc);
+    Real cx_sss = coeff(bxsss_, norm_sss);
+
+    auto from_by = [&](Real coeff_y, Real sign) -> std::pair<Real, Real> {
+      if (std::abs(kx) <= tiny) return std::make_pair(0.0, 0.0);
+      Real val = sign*coeff_y/kx;
+      Real wt = kx*kx;
+      return std::make_pair(val, wt);
+    };
+
+    auto from_bx = [&](Real coeff_x, Real sign) -> std::pair<Real, Real> {
+      if (std::abs(ky) <= tiny) return std::make_pair(0.0, 0.0);
+      Real val = sign*coeff_x/ky;
+      Real wt = ky*ky;
+      return std::make_pair(val, wt);
+    };
+
+    auto blend = [](const std::pair<Real, Real> &a,
+                    const std::pair<Real, Real> &b) -> Real {
+      Real denom = a.second + b.second;
+      if (denom <= 0.0) return 0.0;
+      return (a.first*a.second + b.first*b.second)/denom;
+    };
+
+    psiccc.h_view(n) = blend(from_by(cy_scc,  1.0), from_bx(cx_csc, -1.0));
+    psiccs.h_view(n) = blend(from_by(cy_scs,  1.0), from_bx(cx_css, -1.0));
+    psicsc.h_view(n) = blend(from_by(cy_ssc,  1.0), from_bx(cx_ccc,  1.0));
+    psicss.h_view(n) = blend(from_by(cy_sss,  1.0), from_bx(cx_ccs,  1.0));
+    psiscc.h_view(n) = blend(from_by(cy_ccc, -1.0), from_bx(cx_ssc, -1.0));
+    psiscs.h_view(n) = blend(from_by(cy_ccs, -1.0), from_bx(cx_sss, -1.0));
+    psissc.h_view(n) = blend(from_by(cy_csc, -1.0), from_bx(cx_scc,  1.0));
+    psisss.h_view(n) = blend(from_by(cy_css, -1.0), from_bx(cx_scs,  1.0));
+  }
+
+  psiccc.template sync<DevExeSpace>();
+  psiccs.template sync<DevExeSpace>();
+  psicsc.template sync<DevExeSpace>();
+  psicss.template sync<DevExeSpace>();
+  psiscc.template sync<DevExeSpace>();
+  psiscs.template sync<DevExeSpace>();
+  psissc.template sync<DevExeSpace>();
+  psisss.template sync<DevExeSpace>();
+
+  auto xcos_edge_ = xcos_edge;
+  auto xsin_edge_ = xsin_edge;
+  auto ycos_edge_ = ycos_edge;
+  auto ysin_edge_ = ysin_edge;
+  auto e3 = emf_drive.x3e;
+  auto psiccc_ = psiccc;
+  auto psiccs_ = psiccs;
+  auto psicsc_ = psicsc;
+  auto psicss_ = psicss;
+  auto psiscc_ = psiscc;
+  auto psiscs_ = psiscs;
+  auto psissc_ = psissc;
+  auto psisss_ = psisss;
+  par_for("build_emf_z", DevExeSpace(),0,nmb-1,ks,ke,js,je+1,is,ie+1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    Real sum = 0.0;
+    for (int n=0; n<mode_count_; ++n) {
+      Real xc = xcos_edge_(m,n,i);
+      Real xs = xsin_edge_(m,n,i);
+      Real yc = ycos_edge_(m,n,j);
+      Real ys = ysin_edge_(m,n,j);
+      Real zc = zcos_(m,n,k);
+      Real zs = zsin_(m,n,k);
+
+      sum += psiccc_.d_view(n)*xc*yc*zc;
+      sum += psiccs_.d_view(n)*xc*yc*zs;
+      sum += psicsc_.d_view(n)*xc*ys*zc;
+      sum += psicss_.d_view(n)*xc*ys*zs;
+      sum += psiscc_.d_view(n)*xs*yc*zc;
+      sum += psiscs_.d_view(n)*xs*yc*zs;
+      sum += psissc_.d_view(n)*xs*ys*zc;
+      sum += psisss_.d_view(n)*xs*ys*zs;
+    }
+    e3(m,k,j,i) += sum;
+  });
+
+  emf_ready_ = true;
 }

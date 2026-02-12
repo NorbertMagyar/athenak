@@ -27,6 +27,7 @@
 #include "shearing_box/orbital_advection.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
+#include "srcterms/turb_driver.hpp"
 
 namespace mhd {
 //----------------------------------------------------------------------------------------
@@ -380,6 +381,9 @@ TaskStatus MHD::EFieldSrc(Driver *pdrive, int stage) {
     if (pmy_pack->pmesh->two_d) {
       psbox_b->SourceTermsFC(b0, efld);
     }
+  }
+  if (pmy_pack->pturb != nullptr) {
+    pmy_pack->pturb->ApplyEMF(efld);
   }
   return TaskStatus::complete;
 }
