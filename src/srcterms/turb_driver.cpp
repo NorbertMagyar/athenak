@@ -279,6 +279,38 @@ void TurbulenceDriver::Initialize() {
   });
 
   rstate.idum = -1;
+  Kokkos::deep_copy(xccc.d_view, 0.0);
+  Kokkos::deep_copy(xccs.d_view, 0.0);
+  Kokkos::deep_copy(xcsc.d_view, 0.0);
+  Kokkos::deep_copy(xcss.d_view, 0.0);
+  Kokkos::deep_copy(xscc.d_view, 0.0);
+  Kokkos::deep_copy(xscs.d_view, 0.0);
+  Kokkos::deep_copy(xssc.d_view, 0.0);
+  Kokkos::deep_copy(xsss.d_view, 0.0);
+  Kokkos::deep_copy(yccc.d_view, 0.0);
+  Kokkos::deep_copy(yccs.d_view, 0.0);
+  Kokkos::deep_copy(ycsc.d_view, 0.0);
+  Kokkos::deep_copy(ycss.d_view, 0.0);
+  Kokkos::deep_copy(yscc.d_view, 0.0);
+  Kokkos::deep_copy(yscs.d_view, 0.0);
+  Kokkos::deep_copy(yssc.d_view, 0.0);
+  Kokkos::deep_copy(ysss.d_view, 0.0);
+  Kokkos::deep_copy(zccc.d_view, 0.0);
+  Kokkos::deep_copy(zccs.d_view, 0.0);
+  Kokkos::deep_copy(zcsc.d_view, 0.0);
+  Kokkos::deep_copy(zcss.d_view, 0.0);
+  Kokkos::deep_copy(zscc.d_view, 0.0);
+  Kokkos::deep_copy(zscs.d_view, 0.0);
+  Kokkos::deep_copy(zssc.d_view, 0.0);
+  Kokkos::deep_copy(zsss.d_view, 0.0);
+  Kokkos::deep_copy(psiccc.d_view, 0.0);
+  Kokkos::deep_copy(psiccs.d_view, 0.0);
+  Kokkos::deep_copy(psicsc.d_view, 0.0);
+  Kokkos::deep_copy(psicss.d_view, 0.0);
+  Kokkos::deep_copy(psiscc.d_view, 0.0);
+  Kokkos::deep_copy(psiscs.d_view, 0.0);
+  Kokkos::deep_copy(psissc.d_view, 0.0);
+  Kokkos::deep_copy(psisss.d_view, 0.0);
 
   auto kx_mode_ = kx_mode;
   auto ky_mode_ = ky_mode;
@@ -514,7 +546,6 @@ void TurbulenceDriver::ComputeBasisNorms() {
 void TurbulenceDriver::IncludeInitializeModesTask(std::shared_ptr<TaskList> tl,
                                                   TaskID start) {
   auto id_init = tl->AddTask(&TurbulenceDriver::InitializeModes, this, start);
-  auto id_add = tl->AddTask(&TurbulenceDriver::AddForcing, this, id_init);
   return;
 }
 
@@ -525,19 +556,19 @@ void TurbulenceDriver::IncludeInitializeModesTask(std::shared_ptr<TaskList> tl,
 //  Called by MeshBlockPack::AddPhysics() function
 
 void TurbulenceDriver::IncludeAddForcingTask(std::shared_ptr<TaskList> tl, TaskID start) {
-  // These must be inserted after update task, but before send_u
+  // Insert as a true source-term update in each RK stage (after RKUpdate, before SrcTerms).
   if (pmy_pack->pionn == nullptr) {
     if (pmy_pack->phydro != nullptr) {
       auto id = tl->InsertTask(&TurbulenceDriver::AddForcing, this,
-                              pmy_pack->phydro->id.flux, pmy_pack->phydro->id.rkupdt);
+                              pmy_pack->phydro->id.rkupdt, pmy_pack->phydro->id.srctrms);
     }
     if (pmy_pack->pmhd != nullptr) {
       auto id = tl->InsertTask(&TurbulenceDriver::AddForcing, this,
-                              pmy_pack->pmhd->id.flux, pmy_pack->pmhd->id.rkupdt);
+                              pmy_pack->pmhd->id.rkupdt, pmy_pack->pmhd->id.srctrms);
     }
   } else {
     auto id = tl->InsertTask(&TurbulenceDriver::AddForcing, this,
-                            pmy_pack->pionn->id.n_flux, pmy_pack->pionn->id.n_rkupdt);
+                            pmy_pack->pionn->id.n_rkupdt, pmy_pack->pionn->id.n_srctrms);
   }
 
   return;
@@ -562,539 +593,882 @@ TaskStatus TurbulenceDriver::InitializeModes(Driver *pdrive, int stage) {
   int &gnx2 = gindcs.nx2;
   int &gnx3 = gindcs.nx3;
 
-  // Now compute new force using new random amplitudes and phases
+  if (alfvenic_drive) {
+    int nmb = pmy_pack->nmb_thispack;
+    int nmkji = nmb*nx3*nx2*nx1;
+    int nkji = nx3*nx2*nx1;
+    int nji = nx2*nx1;
+    Real dt = pm->dt;
+    Real dvol = 1.0/(gnx1*gnx2*gnx3);
 
-  // Zero out new force array
-  auto force_tmp_ = force_tmp;
-  int &nmb = pmy_pack->nmb_thispack;
-  par_for("force_init", DevExeSpace(),0,nmb-1,0,2,ks,ke,js,je,is,ie,
-  KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
-    force_tmp_(m,n,k,j,i) = 0.0;
-  });
+    DvceArray5D<Real> u0, u0_;
+    if (pmy_pack->phydro != nullptr) u0 = (pmy_pack->phydro->u0);
+    if (pmy_pack->pmhd != nullptr) u0 = (pmy_pack->pmhd->u0);
+    bool flag_twofl = false;
+    if (pmy_pack->pionn != nullptr) {
+      u0 = (pmy_pack->phydro->u0);
+      u0_ = (pmy_pack->pmhd->u0);
+      flag_twofl = true;
+    }
 
-  int nlow_sqr = SQR(nlow);
-  int nhigh_sqr = SQR(nhigh);
-  auto mode_count_ = mode_count;
+    auto build_force_from_phi = [&](DualArray1D<Real> &c0, DualArray1D<Real> &c1,
+                                    DualArray1D<Real> &c2, DualArray1D<Real> &c3,
+                                    DualArray1D<Real> &c4, DualArray1D<Real> &c5,
+                                    DualArray1D<Real> &c6, DualArray1D<Real> &c7,
+                                    DvceArray5D<Real> target) {
+      auto t_ = target;
+      par_for("phi_force_zero", DevExeSpace(),0,nmb-1,0,2,ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+        t_(m,n,k,j,i) = 0.0;
+      });
 
-  auto xccc_ = xccc;
-  auto xccs_ = xccs;
-  auto xcsc_ = xcsc;
-  auto xcss_ = xcss;
-  auto xscc_ = xscc;
-  auto xscs_ = xscs;
-  auto xssc_ = xssc;
-  auto xsss_ = xsss;
+      auto c0_ = c0;
+      auto c1_ = c1;
+      auto c2_ = c2;
+      auto c3_ = c3;
+      auto c4_ = c4;
+      auto c5_ = c5;
+      auto c6_ = c6;
+      auto c7_ = c7;
+      auto xcos_ = xcos;
+      auto xsin_ = xsin;
+      auto ycos_ = ycos;
+      auto ysin_ = ysin;
+      auto zcos_ = zcos;
+      auto zsin_ = zsin;
+      auto kx_mode_ = kx_mode;
+      auto ky_mode_ = ky_mode;
+      int mode_count_ = mode_count;
+      par_for("phi_force_build", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        Real v1 = 0.0;
+        Real v2 = 0.0;
+        for (int n=0; n<mode_count_; ++n) {
+          Real xc = xcos_(m,n,i);
+          Real xs = xsin_(m,n,i);
+          Real yc = ycos_(m,n,j);
+          Real ys = ysin_(m,n,j);
+          Real zc = zcos_(m,n,k);
+          Real zs = zsin_(m,n,k);
+          Real kx = kx_mode_.d_view(n);
+          Real ky = ky_mode_.d_view(n);
 
-  auto yccc_ = yccc;
-  auto yccs_ = yccs;
-  auto ycsc_ = ycsc;
-  auto ycss_ = ycss;
-  auto yscc_ = yscc;
-  auto yscs_ = yscs;
-  auto yssc_ = yssc;
-  auto ysss_ = ysss;
+          v1 += (-ky)*c0_.d_view(n)*xc*ys*zc;
+          v1 += (-ky)*c1_.d_view(n)*xc*ys*zs;
+          v1 += ( ky)*c2_.d_view(n)*xc*yc*zc;
+          v1 += ( ky)*c3_.d_view(n)*xc*yc*zs;
+          v1 += (-ky)*c4_.d_view(n)*xs*ys*zc;
+          v1 += (-ky)*c5_.d_view(n)*xs*ys*zs;
+          v1 += ( ky)*c6_.d_view(n)*xs*yc*zc;
+          v1 += ( ky)*c7_.d_view(n)*xs*yc*zs;
 
-  auto zccc_ = zccc;
-  auto zccs_ = zccs;
-  auto zcsc_ = zcsc;
-  auto zcss_ = zcss;
-  auto zscc_ = zscc;
-  auto zscs_ = zscs;
-  auto zssc_ = zssc;
-  auto zsss_ = zsss;
+          v2 += ( kx)*c0_.d_view(n)*xs*yc*zc;
+          v2 += ( kx)*c1_.d_view(n)*xs*yc*zs;
+          v2 += ( kx)*c2_.d_view(n)*xs*ys*zc;
+          v2 += ( kx)*c3_.d_view(n)*xs*ys*zs;
+          v2 += (-kx)*c4_.d_view(n)*xc*yc*zc;
+          v2 += (-kx)*c5_.d_view(n)*xc*yc*zs;
+          v2 += (-kx)*c6_.d_view(n)*xc*ys*zc;
+          v2 += (-kx)*c7_.d_view(n)*xc*ys*zs;
+        }
+        t_(m,0,k,j,i) = v1;
+        t_(m,1,k,j,i) = v2;
+        t_(m,2,k,j,i) = 0.0;
+      });
+    };
 
-  Real dkx, dky, dkz, kx, ky, kz;
-  Real iky, ikz;
-  Real lx = pm->mesh_size.x1max - pm->mesh_size.x1min;
-  Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
-  Real lz = pm->mesh_size.x3max - pm->mesh_size.x3min;
-  dkx = 2.0*M_PI/lx;
-  dky = 2.0*M_PI/ly;
-  dkz = 2.0*M_PI/lz;
+    auto normalize_coeffs = [&](DualArray1D<Real> &c0, DualArray1D<Real> &c1,
+                                DualArray1D<Real> &c2, DualArray1D<Real> &c3,
+                                DualArray1D<Real> &c4, DualArray1D<Real> &c5,
+                                DualArray1D<Real> &c6, DualArray1D<Real> &c7,
+                                DvceArray5D<Real> target) {
+      auto t_ = target;
+      Real m0 = 0.0, m1 = 0.0;
+      Kokkos::parallel_reduce("phi_norm", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+      KOKKOS_LAMBDA(const int &idx, Real &sum_m0, Real &sum_m1) {
+        int m = (idx)/nkji;
+        int k = (idx - m*nkji)/nji;
+        int j = (idx - m*nkji - k*nji)/nx1;
+        int i = (idx - m*nkji - k*nji - j*nx1) + is;
+        k += ks;
+        j += js;
 
-  Real &ex = expo;
-  Real &ex_prp = exp_prp;
-  Real &ex_prl = exp_prl;
-  Real norm, kprl, kprp, kiso;
+        Real den  = u0(m,IDN,k,j,i);
+        Real mom1 = u0(m,IM1,k,j,i);
+        Real mom2 = u0(m,IM2,k,j,i);
+        Real mom3 = u0(m,IM3,k,j,i);
+        if (flag_twofl) {
+          den  += u0_(m,IDN,k,j,i);
+          mom1 += u0_(m,IM1,k,j,i);
+          mom2 += u0_(m,IM2,k,j,i);
+          mom3 += u0_(m,IM3,k,j,i);
+        }
+        Real v1 = t_(m,0,k,j,i);
+        Real v2 = t_(m,1,k,j,i);
+        Real v3 = t_(m,2,k,j,i);
+        sum_m0 += den*(v1*v1 + v2*v2 + v3*v3);
+        sum_m1 += mom1*v1 + mom2*v2 + mom3*v3;
+      }, Kokkos::Sum<Real>(m0), Kokkos::Sum<Real>(m1));
 
-  int nmode = 0;
-  int nkx, nky, nkz, nsqr;
-  for (nkx = 0; nkx <= nhigh; nkx++) {
-    for (nky = 0; nky <= nhigh; nky++) {
-      for (nkz = 0; nkz <= nhigh; nkz++) {
-        if (nkx == 0 && nky == 0 && nkz == 0) continue;
-        norm = 0.0;
-        nsqr = 0.0;
-        bool flag_prl = true;
-        if (driving_type == 0) {
-          nsqr = SQR(nkx) + SQR(nky) + SQR(nkz);
-        } else if (driving_type == 1) {
-          nsqr = SQR(nkx) + SQR(nky);
-          Real nprlsqr = SQR(nkz);
-          if (nprlsqr >= nlow_sqr && nprlsqr <= nhigh_sqr) {
-            flag_prl = true;
+#if MPI_PARALLEL_ENABLED
+      Real m_loc2[2], gm2[2];
+      m_loc2[0] = m0; m_loc2[1] = m1;
+      MPI_Allreduce(m_loc2, gm2, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      m0 = gm2[0]; m1 = gm2[1];
+#endif
+
+      Real s = 1.0;
+      if (control_mode == ForceControl::kPower) {
+        Real m0p = 0.5*m0*dvol*dt;
+        Real m1p = m1*dvol;
+        if (m0p > 0.0) {
+          if (m1p >= 0.0) {
+            s = -m1p/2./m0p + sqrt(m1p*m1p/4./m0p/m0p + dedt/m0p);
           } else {
-            flag_prl = false;
+            s = m1p/2./m0p + sqrt(m1p*m1p/4./m0p/m0p + dedt/m0p);
           }
+        } else {
+          s = 0.0;
         }
-        if (nsqr >= nlow_sqr && nsqr <= nhigh_sqr && flag_prl) {
-          kx = dkx*nkx;
-          ky = dky*nky;
-          kz = dkz*nkz;
-
-          // Generate Fourier amplitudes
-          if (driving_type == 0) {
-            kiso = sqrt(SQR(kx) + SQR(ky) + SQR(kz));
-            if (kiso > 1e-16) {
-              norm = 1.0/pow(kiso,(ex+2.0)/2.0);
-            } else {
-              norm = 0.0;
-            }
-            if (nkz != 0) {
-              ikz = 1.0/(dkz*((Real) nkz));
-
-              xccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xccs_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xcsc_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              xcss_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              xscc_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              xscs_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              xssc_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
-              xsss_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
-
-              yccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              yccs_.h_view(nmode) = RanGaussianSt(&(rstate));
-              ycsc_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              ycss_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              yscc_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              yscs_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
-              yssc_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
-              ysss_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
-
-              // imcompressibility
-              zccc_.h_view(nmode) =  ikz*( kx*xscs_.h_view(nmode)+ky*ycss_.h_view(nmode));
-              zccs_.h_view(nmode) = -ikz*( kx*xscc_.h_view(nmode)+ky*ycsc_.h_view(nmode));
-              zcsc_.h_view(nmode) =  ikz*( kx*xsss_.h_view(nmode)-ky*yccs_.h_view(nmode));
-              zcss_.h_view(nmode) =  ikz*(-kx*xssc_.h_view(nmode)+ky*yccc_.h_view(nmode));
-              zscc_.h_view(nmode) =  ikz*(-kx*xccs_.h_view(nmode)+ky*ysss_.h_view(nmode));
-              zscs_.h_view(nmode) =  ikz*( kx*xccc_.h_view(nmode)-ky*yssc_.h_view(nmode));
-              zssc_.h_view(nmode) = -ikz*( kx*xcss_.h_view(nmode)+ky*yscs_.h_view(nmode));
-              zsss_.h_view(nmode) =  ikz*( kx*xcsc_.h_view(nmode)+ky*yscc_.h_view(nmode));
-            } else if (nky != 0) {  // kz == 0
-              iky = 1.0/(dky*((Real) nky));
-
-              xccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xcsc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xscc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-              xssc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-              xccs_.h_view(nmode) = 0.0;
-              xscs_.h_view(nmode) = 0.0;
-              xcss_.h_view(nmode) = 0.0;
-              xsss_.h_view(nmode) = 0.0;
-
-              zccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              zcsc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              zscc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-              zssc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-              zccs_.h_view(nmode) = 0.0;
-              zcss_.h_view(nmode) = 0.0;
-              zscs_.h_view(nmode) = 0.0;
-              zsss_.h_view(nmode) = 0.0;
-
-              // incompressibility
-              yccc_.h_view(nmode) =  iky*kx*xssc_.h_view(nmode);
-              ycsc_.h_view(nmode) = -iky*kx*xscc_.h_view(nmode);
-              yscc_.h_view(nmode) = -iky*kx*xcsc_.h_view(nmode);
-              yssc_.h_view(nmode) =  iky*kx*xccc_.h_view(nmode);
-              yccs_.h_view(nmode) = 0.0;
-              ycss_.h_view(nmode) = 0.0;
-              yscs_.h_view(nmode) = 0.0;
-              ysss_.h_view(nmode) = 0.0;
-            } else {  // kz == ky == 0, kx != 0 by initial if statement
-              zccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              zscc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              zcsc_.h_view(nmode) = 0.0;
-              zssc_.h_view(nmode) = 0.0;
-              zccs_.h_view(nmode) = 0.0;
-              zcss_.h_view(nmode) = 0.0;
-              zscs_.h_view(nmode) = 0.0;
-              zsss_.h_view(nmode) = 0.0;
-
-              yccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              yscc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              ycsc_.h_view(nmode) = 0.0;
-              yssc_.h_view(nmode) = 0.0;
-              yccs_.h_view(nmode) = 0.0;
-              ycss_.h_view(nmode) = 0.0;
-              yscs_.h_view(nmode) = 0.0;
-              ysss_.h_view(nmode) = 0.0;
-
-              // incompressibility
-              xccc_.h_view(nmode) = 0.0;
-              xscc_.h_view(nmode) = 0.0;
-              xcsc_.h_view(nmode) = 0.0;
-              xssc_.h_view(nmode) = 0.0;
-              xccs_.h_view(nmode) = 0.0;
-              xscs_.h_view(nmode) = 0.0;
-              xcss_.h_view(nmode) = 0.0;
-              xsss_.h_view(nmode) = 0.0;
-            }
-          } else if (driving_type == 1) {
-            kprl = sqrt(SQR(kx));
-            kprp = sqrt(SQR(ky) + SQR(kz));
-            if (kprl > 1e-16 && kprp > 1e-16) {
-              norm = 1.0/pow(kprp,(ex_prp+1.0)/2.0)/pow(kprl,ex_prl/2.0);
-            } else {
-              norm = 0.0;
-            }
-
-            if (nky != 0) {
-              iky = 1.0/(dky*((Real) nky));
-
-              xccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xccs_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xcsc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xcss_.h_view(nmode) = RanGaussianSt(&(rstate));
-              xscc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-              xscs_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-              xssc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-              xsss_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
-
-              // incompressibility
-              yccc_.h_view(nmode) =  iky*(kx*xssc_.h_view(nmode));
-              yccs_.h_view(nmode) =  iky*(kx*xsss_.h_view(nmode));
-              ycsc_.h_view(nmode) = -iky*(kx*xscc_.h_view(nmode));
-              ycss_.h_view(nmode) = -iky*(kx*xscs_.h_view(nmode));
-              yscc_.h_view(nmode) = -iky*(kx*xcsc_.h_view(nmode));
-              yscs_.h_view(nmode) = -iky*(kx*xcss_.h_view(nmode));
-              yssc_.h_view(nmode) =  iky*(kx*xccc_.h_view(nmode));
-              ysss_.h_view(nmode) =  iky*(kx*xccs_.h_view(nmode));
-
-              zccc_.h_view(nmode) = 0.0;
-              zccs_.h_view(nmode) = 0.0;
-              zcsc_.h_view(nmode) = 0.0;
-              zcss_.h_view(nmode) = 0.0;
-              zscc_.h_view(nmode) = 0.0;
-              zscs_.h_view(nmode) = 0.0;
-              zssc_.h_view(nmode) = 0.0;
-              zsss_.h_view(nmode) = 0.0;
-            } else {  // ky == 0
-              yccc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              yscc_.h_view(nmode) = RanGaussianSt(&(rstate));
-              ycsc_.h_view(nmode) = 0.0;
-              yssc_.h_view(nmode) = 0.0;
-              yccs_.h_view(nmode) = 0.0;
-              ycss_.h_view(nmode) = 0.0;
-              yscs_.h_view(nmode) = 0.0;
-              ysss_.h_view(nmode) = 0.0;
-
-              // incompressibility
-              xccc_.h_view(nmode) = 0.0;
-              xscc_.h_view(nmode) = 0.0;
-              xcsc_.h_view(nmode) = 0.0;
-              xssc_.h_view(nmode) = 0.0;
-              xccs_.h_view(nmode) = 0.0;
-              xscs_.h_view(nmode) = 0.0;
-              xcss_.h_view(nmode) = 0.0;
-              xsss_.h_view(nmode) = 0.0;
-
-              zccc_.h_view(nmode) = 0.0;
-              zscc_.h_view(nmode) = 0.0;
-              zcsc_.h_view(nmode) = 0.0;
-              zssc_.h_view(nmode) = 0.0;
-              zccs_.h_view(nmode) = 0.0;
-              zcss_.h_view(nmode) = 0.0;
-              zscs_.h_view(nmode) = 0.0;
-              zsss_.h_view(nmode) = 0.0;
-            }
-          }
-          // normalization
-          xccc_.h_view(nmode) *= norm;
-          xscc_.h_view(nmode) *= norm;
-          xcsc_.h_view(nmode) *= norm;
-          xssc_.h_view(nmode) *= norm;
-          xccs_.h_view(nmode) *= norm;
-          xscs_.h_view(nmode) *= norm;
-          xcss_.h_view(nmode) *= norm;
-          xsss_.h_view(nmode) *= norm;
-          yccc_.h_view(nmode) *= norm;
-          yscc_.h_view(nmode) *= norm;
-          ycsc_.h_view(nmode) *= norm;
-          yssc_.h_view(nmode) *= norm;
-          yccs_.h_view(nmode) *= norm;
-          yscs_.h_view(nmode) *= norm;
-          ycss_.h_view(nmode) *= norm;
-          ysss_.h_view(nmode) *= norm;
-          zccc_.h_view(nmode) *= norm;
-          zscc_.h_view(nmode) *= norm;
-          zcsc_.h_view(nmode) *= norm;
-          zssc_.h_view(nmode) *= norm;
-          zccs_.h_view(nmode) *= norm;
-          zscs_.h_view(nmode) *= norm;
-          zcss_.h_view(nmode) *= norm;
-          zsss_.h_view(nmode) *= norm;
-
-          nmode++;
-        }
-      }
-    }
-  }
-
-  xccc_.template modify<HostMemSpace>();
-  xccc_.template sync<DevExeSpace>();
-  xccs_.template modify<HostMemSpace>();
-  xccs_.template sync<DevExeSpace>();
-  xcsc_.template modify<HostMemSpace>();
-  xcsc_.template sync<DevExeSpace>();
-  xcss_.template modify<HostMemSpace>();
-  xcss_.template sync<DevExeSpace>();
-  xscc_.template modify<HostMemSpace>();
-  xscc_.template sync<DevExeSpace>();
-  xscs_.template modify<HostMemSpace>();
-  xscs_.template sync<DevExeSpace>();
-  xssc_.template modify<HostMemSpace>();
-  xssc_.template sync<DevExeSpace>();
-  xsss_.template modify<HostMemSpace>();
-  xsss_.template sync<DevExeSpace>();
-
-  yccc_.template modify<HostMemSpace>();
-  yccc_.template sync<DevExeSpace>();
-  yccs_.template modify<HostMemSpace>();
-  yccs_.template sync<DevExeSpace>();
-  ycsc_.template modify<HostMemSpace>();
-  ycsc_.template sync<DevExeSpace>();
-  ycss_.template modify<HostMemSpace>();
-  ycss_.template sync<DevExeSpace>();
-  yscc_.template modify<HostMemSpace>();
-  yscc_.template sync<DevExeSpace>();
-  yscs_.template modify<HostMemSpace>();
-  yscs_.template sync<DevExeSpace>();
-  yssc_.template modify<HostMemSpace>();
-  yssc_.template sync<DevExeSpace>();
-  ysss_.template modify<HostMemSpace>();
-  ysss_.template sync<DevExeSpace>();
-
-  zccc_.template modify<HostMemSpace>();
-  zccc_.template sync<DevExeSpace>();
-  zccs_.template modify<HostMemSpace>();
-  zccs_.template sync<DevExeSpace>();
-  zcsc_.template modify<HostMemSpace>();
-  zcsc_.template sync<DevExeSpace>();
-  zcss_.template modify<HostMemSpace>();
-  zcss_.template sync<DevExeSpace>();
-  zscc_.template modify<HostMemSpace>();
-  zscc_.template sync<DevExeSpace>();
-  zscs_.template modify<HostMemSpace>();
-  zscs_.template sync<DevExeSpace>();
-  zssc_.template modify<HostMemSpace>();
-  zssc_.template sync<DevExeSpace>();
-  zsss_.template modify<HostMemSpace>();
-  zsss_.template sync<DevExeSpace>();
-
-  auto xcos_ = xcos;
-  auto xsin_ = xsin;
-  auto ycos_ = ycos;
-  auto ysin_ = ysin;
-  auto zcos_ = zcos;
-  auto zsin_ = zsin;
-
-  for (int n=0; n<mode_count_; n++) {
-    par_for("force_compute", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
-    KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      force_tmp_(m,0,k,j,i) += xccc_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,0,k,j,i) += xccs_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,0,k,j,i) += xcsc_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,0,k,j,i) += xcss_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,0,k,j,i) += xscc_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,0,k,j,i) += xscs_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,0,k,j,i) += xssc_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,0,k,j,i) += xsss_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
-
-      force_tmp_(m,1,k,j,i) += yccc_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,1,k,j,i) += yccs_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,1,k,j,i) += ycsc_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,1,k,j,i) += ycss_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,1,k,j,i) += yscc_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,1,k,j,i) += yscs_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,1,k,j,i) += yssc_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,1,k,j,i) += ysss_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
-
-      force_tmp_(m,2,k,j,i) += zccc_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,2,k,j,i) += zccs_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,2,k,j,i) += zcsc_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,2,k,j,i) += zcss_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,2,k,j,i) += zscc_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,2,k,j,i) += zscs_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
-      force_tmp_(m,2,k,j,i) += zssc_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
-      force_tmp_(m,2,k,j,i) += zsss_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
-    });
-  }
-
-  DvceArray5D<Real> u0, u0_;
-  if (pmy_pack->phydro != nullptr) u0 = (pmy_pack->phydro->u0);
-  if (pmy_pack->pmhd != nullptr) u0 = (pmy_pack->pmhd->u0);
-  bool flag_twofl = false;
-  if (pmy_pack->pionn != nullptr) {
-    u0 = (pmy_pack->phydro->u0);
-    u0_ = (pmy_pack->pmhd->u0);
-    flag_twofl = true;
-  }
-
-  const int nmkji = nmb*nx3*nx2*nx1;
-  const int nkji = nx3*nx2*nx1;
-  const int nji  = nx2*nx1;
-  Real t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
-
-  Kokkos::parallel_reduce("net_mom_1", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
-  KOKKOS_LAMBDA(const int &idx, Real &sum_t0, Real &sum_t1,
-                                Real &sum_t2, Real &sum_t3) {
-    // compute n,k,j,i indices of thread
-    int m = (idx)/nkji;
-    int k = (idx - m*nkji)/nji;
-    int j = (idx - m*nkji - k*nji)/nx1;
-    int i = (idx - m*nkji - k*nji - j*nx1) + is;
-    k += ks;
-    j += js;
-    Real den = u0(m,IDN,k,j,i);
-    if (flag_twofl) {
-      den += u0_(m,IDN,k,j,i);
-    }
-    sum_t0 += den;
-    sum_t1 += den*force_tmp_(m,0,k,j,i);
-    sum_t2 += den*force_tmp_(m,1,k,j,i);
-    sum_t3 += den*force_tmp_(m,2,k,j,i);
-  }, Kokkos::Sum<Real>(t0), Kokkos::Sum<Real>(t1),
-     Kokkos::Sum<Real>(t2), Kokkos::Sum<Real>(t3));
-
-
-#if MPI_PARALLEL_ENABLED
-  Real m[4], gm[4];
-  m[0] = t0; m[1] = t1; m[2] = t2; m[3] = t3;
-  MPI_Allreduce(m, gm, 4, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-  t0 = gm[0]; t1 = gm[1]; t2 = gm[2]; t3 = gm[3];
-#endif
-
-  par_for("force_remove_net_mom", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    force_tmp_(m,0,k,j,i) -= t1/t0;
-    force_tmp_(m,1,k,j,i) -= t2/t0;
-    force_tmp_(m,2,k,j,i) -= t3/t0;
-  });
-
-  t0 = 0.0;
-  t1 = 0.0;
-  Kokkos::parallel_reduce("net_mom_2", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
-  KOKKOS_LAMBDA(const int &idx, Real &sum_t0, Real &sum_t1) {
-    // compute n,k,j,i indices of thread
-    int m = (idx)/nkji;
-    int k = (idx - m*nkji)/nji;
-    int j = (idx - m*nkji - k*nji)/nx1;
-    int i = (idx - m*nkji - k*nji - j*nx1) + is;
-    k += ks;
-    j += js;
-
-    Real den  = u0(m,IDN,k,j,i);
-    Real mom1 = u0(m,IM1,k,j,i);
-    Real mom2 = u0(m,IM2,k,j,i);
-    Real mom3 = u0(m,IM3,k,j,i);
-    if (flag_twofl) {
-      den  += u0_(m,IDN,k,j,i);
-      mom1 += u0_(m,IM1,k,j,i);
-      mom2 += u0_(m,IM2,k,j,i);
-      mom3 += u0_(m,IM3,k,j,i);
-    }
-    Real v1 = force_tmp_(m,0,k,j,i);
-    Real v2 = force_tmp_(m,1,k,j,i);
-    Real v3 = force_tmp_(m,2,k,j,i);
-
-    sum_t0 += den*(v1*v1+v2*v2+v3*v3);
-    sum_t1 += mom1*v1+mom2*v2+mom3*v3;
-  }, Kokkos::Sum<Real>(t0), Kokkos::Sum<Real>(t1));
-
-#if MPI_PARALLEL_ENABLED
-  m[0] = t0; m[1] = t1;
-  MPI_Allreduce(m, gm, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-  t0 = gm[0]; t1 = gm[1];
-#endif
-
-  t0 = std::max(t0, 1.0e-20);
-  t1 = std::max(t1, 1.0e-20);
-
-  Real m0 = t0, m1 = t1;
-  Real dt = pm->dt;
-  Real dvol = 1.0/(gnx1*gnx2*gnx3);
-  Real s = 1.0;
-  if (control_mode == ForceControl::kPower) {
-    m0 = 0.5*m0*dvol*dt;
-    m1 = m1*dvol;
-    if (m0 != 0.0) {
-      if (m1 >= 0) {
-        s = -m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
       } else {
-        s = m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
+        Real tforce = 0.0;
+        Kokkos::parallel_reduce("phi_force_rms", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+        KOKKOS_LAMBDA(const int &idx, Real &sum_tf) {
+          int m = (idx)/nkji;
+          int k = (idx - m*nkji)/nji;
+          int j = (idx - m*nkji - k*nji)/nx1;
+          int i = (idx - m*nkji - k*nji - j*nx1) + is;
+          k += ks;
+          j += js;
+          Real v1 = t_(m,0,k,j,i);
+          Real v2 = t_(m,1,k,j,i);
+          Real v3 = t_(m,2,k,j,i);
+          sum_tf += v1*v1 + v2*v2 + v3*v3;
+        }, Kokkos::Sum<Real>(tforce));
+#if MPI_PARALLEL_ENABLED
+        Real mt[1], gmt[1];
+        mt[0] = tforce;
+        MPI_Allreduce(mt, gmt, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        tforce = gmt[0];
+#endif
+        Real frms_sq = tforce*dvol;
+        Real accel_target = std::abs(accel_rms);
+        s = (frms_sq > 0.0) ? (accel_target/std::sqrt(frms_sq)) : 0.0;
       }
-    } else {
-      s = 0.0;
+
+      par_for("phi_force_scale", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        t_(m,0,k,j,i) *= s;
+        t_(m,1,k,j,i) *= s;
+        t_(m,2,k,j,i) *= s;
+      });
+
+      c0.template sync<HostMemSpace>();
+      c1.template sync<HostMemSpace>();
+      c2.template sync<HostMemSpace>();
+      c3.template sync<HostMemSpace>();
+      c4.template sync<HostMemSpace>();
+      c5.template sync<HostMemSpace>();
+      c6.template sync<HostMemSpace>();
+      c7.template sync<HostMemSpace>();
+      c0.template modify<HostMemSpace>();
+      c1.template modify<HostMemSpace>();
+      c2.template modify<HostMemSpace>();
+      c3.template modify<HostMemSpace>();
+      c4.template modify<HostMemSpace>();
+      c5.template modify<HostMemSpace>();
+      c6.template modify<HostMemSpace>();
+      c7.template modify<HostMemSpace>();
+      for (int n=0; n<mode_count; ++n) {
+        c0.h_view(n) *= s;
+        c1.h_view(n) *= s;
+        c2.h_view(n) *= s;
+        c3.h_view(n) *= s;
+        c4.h_view(n) *= s;
+        c5.h_view(n) *= s;
+        c6.h_view(n) *= s;
+        c7.h_view(n) *= s;
+      }
+      c0.template sync<DevExeSpace>();
+      c1.template sync<DevExeSpace>();
+      c2.template sync<DevExeSpace>();
+      c3.template sync<DevExeSpace>();
+      c4.template sync<DevExeSpace>();
+      c5.template sync<DevExeSpace>();
+      c6.template sync<DevExeSpace>();
+      c7.template sync<DevExeSpace>();
+    };
+
+    auto randomize_phi = [&](DualArray1D<Real> &c0, DualArray1D<Real> &c1,
+                             DualArray1D<Real> &c2, DualArray1D<Real> &c3,
+                             DualArray1D<Real> &c4, DualArray1D<Real> &c5,
+                             DualArray1D<Real> &c6, DualArray1D<Real> &c7) {
+      c0.template sync<HostMemSpace>();
+      c1.template sync<HostMemSpace>();
+      c2.template sync<HostMemSpace>();
+      c3.template sync<HostMemSpace>();
+      c4.template sync<HostMemSpace>();
+      c5.template sync<HostMemSpace>();
+      c6.template sync<HostMemSpace>();
+      c7.template sync<HostMemSpace>();
+      c0.template modify<HostMemSpace>();
+      c1.template modify<HostMemSpace>();
+      c2.template modify<HostMemSpace>();
+      c3.template modify<HostMemSpace>();
+      c4.template modify<HostMemSpace>();
+      c5.template modify<HostMemSpace>();
+      c6.template modify<HostMemSpace>();
+      c7.template modify<HostMemSpace>();
+
+      for (int n=0; n<mode_count; ++n) {
+        Real kx = kx_mode.h_view(n);
+        Real ky = ky_mode.h_view(n);
+        Real kz = kz_mode.h_view(n);
+        Real norm = 0.0;
+        if (driving_type == 0) {
+          Real kiso = sqrt(SQR(kx) + SQR(ky) + SQR(kz));
+          if (kiso > 1.0e-16) norm = 1.0/pow(kiso,(expo+2.0)/2.0);
+        } else {
+          Real kprl = std::abs(kx);
+          Real kprp = sqrt(SQR(ky) + SQR(kz));
+          if (kprl > 1.0e-16 && kprp > 1.0e-16) {
+            norm = 1.0/pow(kprp,(exp_prp+1.0)/2.0)/pow(kprl,exp_prl/2.0);
+          }
+        }
+        if (sqrt(SQR(kx) + SQR(ky)) <= 1.0e-16) norm = 0.0;
+
+        c0.h_view(n) = norm*RanGaussianSt(&(rstate));
+        c1.h_view(n) = norm*RanGaussianSt(&(rstate));
+        c2.h_view(n) = norm*RanGaussianSt(&(rstate));
+        c3.h_view(n) = norm*RanGaussianSt(&(rstate));
+        c4.h_view(n) = norm*RanGaussianSt(&(rstate));
+        c5.h_view(n) = norm*RanGaussianSt(&(rstate));
+        c6.h_view(n) = norm*RanGaussianSt(&(rstate));
+        c7.h_view(n) = norm*RanGaussianSt(&(rstate));
+      }
+
+      c0.template sync<DevExeSpace>();
+      c1.template sync<DevExeSpace>();
+      c2.template sync<DevExeSpace>();
+      c3.template sync<DevExeSpace>();
+      c4.template sync<DevExeSpace>();
+      c5.template sync<DevExeSpace>();
+      c6.template sync<DevExeSpace>();
+      c7.template sync<DevExeSpace>();
+    };
+
+    // Use z* for z+ target coefficients and psi* for z- target coefficients.
+    randomize_phi(zccc, zccs, zcsc, zcss, zscc, zscs, zssc, zsss);
+    randomize_phi(psiccc, psiccs, psicsc, psicss, psiscc, psiscs, psissc, psisss);
+
+    build_force_from_phi(zccc, zccs, zcsc, zcss, zscc, zscs, zssc, zsss, force_plus_tmp);
+    normalize_coeffs(zccc, zccs, zcsc, zcss, zscc, zscs, zssc, zsss, force_plus_tmp);
+    build_force_from_phi(psiccc, psiccs, psicsc, psicss,
+                         psiscc, psiscs, psissc, psisss, force_minus_tmp);
+    normalize_coeffs(psiccc, psiccs, psicsc, psicss,
+                     psiscc, psiscs, psissc, psisss, force_minus_tmp);
+
+    return TaskStatus::complete;
+  }
+
+  auto synthesize = [&](DvceArray5D<Real> target) {
+    auto force_tmp_ = target;
+    int &nmb = pmy_pack->nmb_thispack;
+    par_for("force_init", DevExeSpace(),0,nmb-1,0,2,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+      force_tmp_(m,n,k,j,i) = 0.0;
+    });
+
+    int nlow_sqr = SQR(nlow);
+    int nhigh_sqr = SQR(nhigh);
+    auto mode_count_ = mode_count;
+
+    auto xccc_ = xccc;
+    auto xccs_ = xccs;
+    auto xcsc_ = xcsc;
+    auto xcss_ = xcss;
+    auto xscc_ = xscc;
+    auto xscs_ = xscs;
+    auto xssc_ = xssc;
+    auto xsss_ = xsss;
+
+    auto yccc_ = yccc;
+    auto yccs_ = yccs;
+    auto ycsc_ = ycsc;
+    auto ycss_ = ycss;
+    auto yscc_ = yscc;
+    auto yscs_ = yscs;
+    auto yssc_ = yssc;
+    auto ysss_ = ysss;
+
+    auto zccc_ = zccc;
+    auto zccs_ = zccs;
+    auto zcsc_ = zcsc;
+    auto zcss_ = zcss;
+    auto zscc_ = zscc;
+    auto zscs_ = zscs;
+    auto zssc_ = zssc;
+    auto zsss_ = zsss;
+
+    Real dkx, dky, dkz, kx, ky, kz;
+    Real iky, ikz;
+    Real lx = pm->mesh_size.x1max - pm->mesh_size.x1min;
+    Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
+    Real lz = pm->mesh_size.x3max - pm->mesh_size.x3min;
+    dkx = 2.0*M_PI/lx;
+    dky = 2.0*M_PI/ly;
+    dkz = 2.0*M_PI/lz;
+
+    Real &ex = expo;
+    Real &ex_prp = exp_prp;
+    Real &ex_prl = exp_prl;
+    Real norm, kprl, kprp, kiso;
+
+    int nmode = 0;
+    int nkx, nky, nkz, nsqr;
+    for (nkx = 0; nkx <= nhigh; nkx++) {
+      for (nky = 0; nky <= nhigh; nky++) {
+        for (nkz = 0; nkz <= nhigh; nkz++) {
+          if (nkx == 0 && nky == 0 && nkz == 0) continue;
+          norm = 0.0;
+          nsqr = 0.0;
+          bool flag_prl = true;
+          if (driving_type == 0) {
+            nsqr = SQR(nkx) + SQR(nky) + SQR(nkz);
+          } else if (driving_type == 1) {
+            nsqr = SQR(nkx) + SQR(nky);
+            Real nprlsqr = SQR(nkz);
+            if (nprlsqr >= nlow_sqr && nprlsqr <= nhigh_sqr) {
+              flag_prl = true;
+            } else {
+              flag_prl = false;
+            }
+          }
+          if (nsqr >= nlow_sqr && nsqr <= nhigh_sqr && flag_prl) {
+            kx = dkx*nkx;
+            ky = dky*nky;
+            kz = dkz*nkz;
+
+            if (alfvenic_drive) {
+              // Build transverse, solenoidal forcing from a streamfunction:
+              // f_perp = zhat x grad_perp(psi), so fz=0 and div(f_perp)=0.
+              Real kperp = sqrt(SQR(kx) + SQR(ky));
+              if (driving_type == 0) {
+                kiso = sqrt(SQR(kx) + SQR(ky) + SQR(kz));
+                if (kiso > 1e-16) {
+                  norm = 1.0/pow(kiso,(ex+2.0)/2.0);
+                } else {
+                  norm = 0.0;
+                }
+              } else if (driving_type == 1) {
+                kprl = sqrt(SQR(kx));
+                kprp = sqrt(SQR(ky) + SQR(kz));
+                if (kprl > 1e-16 && kprp > 1e-16) {
+                  norm = 1.0/pow(kprp,(ex_prp+1.0)/2.0)/pow(kprl,ex_prl/2.0);
+                } else {
+                  norm = 0.0;
+                }
+              }
+
+              if (kperp > 1e-16) {
+                Real ikperp = 1.0/kperp;
+                Real pccc = RanGaussianSt(&(rstate));
+                Real pccs = RanGaussianSt(&(rstate));
+                Real pcsc = (nky == 0) ? 0.0 : RanGaussianSt(&(rstate));
+                Real pcss = (nky == 0) ? 0.0 : RanGaussianSt(&(rstate));
+                Real pscc = (nkx == 0) ? 0.0 : RanGaussianSt(&(rstate));
+                Real pscs = (nkx == 0) ? 0.0 : RanGaussianSt(&(rstate));
+                Real pssc = (nkx == 0 || nky == 0) ? 0.0 : RanGaussianSt(&(rstate));
+                Real psss = (nkx == 0 || nky == 0) ? 0.0 : RanGaussianSt(&(rstate));
+
+                xccc_.h_view(nmode) =  ikperp*ky*pcsc;
+                xccs_.h_view(nmode) =  ikperp*ky*pcss;
+                xcsc_.h_view(nmode) = -ikperp*ky*pccc;
+                xcss_.h_view(nmode) = -ikperp*ky*pccs;
+                xscc_.h_view(nmode) =  ikperp*ky*pssc;
+                xscs_.h_view(nmode) =  ikperp*ky*psss;
+                xssc_.h_view(nmode) = -ikperp*ky*pscc;
+                xsss_.h_view(nmode) = -ikperp*ky*pscs;
+
+                yccc_.h_view(nmode) = -ikperp*kx*pscc;
+                yccs_.h_view(nmode) = -ikperp*kx*pscs;
+                ycsc_.h_view(nmode) = -ikperp*kx*pssc;
+                ycss_.h_view(nmode) = -ikperp*kx*psss;
+                yscc_.h_view(nmode) =  ikperp*kx*pccc;
+                yscs_.h_view(nmode) =  ikperp*kx*pccs;
+                yssc_.h_view(nmode) =  ikperp*kx*pcsc;
+                ysss_.h_view(nmode) =  ikperp*kx*pcss;
+              } else {
+                norm = 0.0;
+                xccc_.h_view(nmode) = 0.0;
+                xccs_.h_view(nmode) = 0.0;
+                xcsc_.h_view(nmode) = 0.0;
+                xcss_.h_view(nmode) = 0.0;
+                xscc_.h_view(nmode) = 0.0;
+                xscs_.h_view(nmode) = 0.0;
+                xssc_.h_view(nmode) = 0.0;
+                xsss_.h_view(nmode) = 0.0;
+                yccc_.h_view(nmode) = 0.0;
+                yccs_.h_view(nmode) = 0.0;
+                ycsc_.h_view(nmode) = 0.0;
+                ycss_.h_view(nmode) = 0.0;
+                yscc_.h_view(nmode) = 0.0;
+                yscs_.h_view(nmode) = 0.0;
+                yssc_.h_view(nmode) = 0.0;
+                ysss_.h_view(nmode) = 0.0;
+              }
+
+              zccc_.h_view(nmode) = 0.0;
+              zccs_.h_view(nmode) = 0.0;
+              zcsc_.h_view(nmode) = 0.0;
+              zcss_.h_view(nmode) = 0.0;
+              zscc_.h_view(nmode) = 0.0;
+              zscs_.h_view(nmode) = 0.0;
+              zssc_.h_view(nmode) = 0.0;
+              zsss_.h_view(nmode) = 0.0;
+            } else if (driving_type == 0) {
+              kiso = sqrt(SQR(kx) + SQR(ky) + SQR(kz));
+              if (kiso > 1e-16) {
+                norm = 1.0/pow(kiso,(ex+2.0)/2.0);
+              } else {
+                norm = 0.0;
+              }
+              if (nkz != 0) {
+                ikz = 1.0/(dkz*((Real) nkz));
+
+                xccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xccs_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xcsc_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                xcss_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                xscc_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                xscs_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                xssc_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
+                xsss_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
+
+                yccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                yccs_.h_view(nmode) = RanGaussianSt(&(rstate));
+                ycsc_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                ycss_.h_view(nmode) = (nky==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                yscc_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                yscs_.h_view(nmode) = (nkx==0)           ? 0.0 : RanGaussianSt(&(rstate));
+                yssc_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
+                ysss_.h_view(nmode) = (nkx==0 || nky==0) ? 0.0 : RanGaussianSt(&(rstate));
+
+                zccc_.h_view(nmode) =  ikz*( kx*xscs_.h_view(nmode)+ky*ycss_.h_view(nmode));
+                zccs_.h_view(nmode) = -ikz*( kx*xscc_.h_view(nmode)+ky*ycsc_.h_view(nmode));
+                zcsc_.h_view(nmode) =  ikz*( kx*xsss_.h_view(nmode)-ky*yccs_.h_view(nmode));
+                zcss_.h_view(nmode) =  ikz*(-kx*xssc_.h_view(nmode)+ky*yccc_.h_view(nmode));
+                zscc_.h_view(nmode) =  ikz*(-kx*xccs_.h_view(nmode)+ky*ysss_.h_view(nmode));
+                zscs_.h_view(nmode) =  ikz*( kx*xccc_.h_view(nmode)-ky*yssc_.h_view(nmode));
+                zssc_.h_view(nmode) = -ikz*( kx*xcss_.h_view(nmode)+ky*yscs_.h_view(nmode));
+                zsss_.h_view(nmode) =  ikz*( kx*xcsc_.h_view(nmode)+ky*yscc_.h_view(nmode));
+              } else if (nky != 0) {
+                iky = 1.0/(dky*((Real) nky));
+
+                xccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xcsc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xscc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+                xssc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+                xccs_.h_view(nmode) = 0.0;
+                xscs_.h_view(nmode) = 0.0;
+                xcss_.h_view(nmode) = 0.0;
+                xsss_.h_view(nmode) = 0.0;
+
+                zccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                zcsc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                zscc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+                zssc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+                zccs_.h_view(nmode) = 0.0;
+                zcss_.h_view(nmode) = 0.0;
+                zscs_.h_view(nmode) = 0.0;
+                zsss_.h_view(nmode) = 0.0;
+
+                yccc_.h_view(nmode) =  iky*kx*xssc_.h_view(nmode);
+                ycsc_.h_view(nmode) = -iky*kx*xscc_.h_view(nmode);
+                yscc_.h_view(nmode) = -iky*kx*xcsc_.h_view(nmode);
+                yssc_.h_view(nmode) =  iky*kx*xccc_.h_view(nmode);
+                yccs_.h_view(nmode) = 0.0;
+                ycss_.h_view(nmode) = 0.0;
+                yscs_.h_view(nmode) = 0.0;
+                ysss_.h_view(nmode) = 0.0;
+              } else {
+                zccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                zscc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                zcsc_.h_view(nmode) = 0.0;
+                zssc_.h_view(nmode) = 0.0;
+                zccs_.h_view(nmode) = 0.0;
+                zcss_.h_view(nmode) = 0.0;
+                zscs_.h_view(nmode) = 0.0;
+                zsss_.h_view(nmode) = 0.0;
+
+                yccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                yscc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                ycsc_.h_view(nmode) = 0.0;
+                yssc_.h_view(nmode) = 0.0;
+                yccs_.h_view(nmode) = 0.0;
+                ycss_.h_view(nmode) = 0.0;
+                yscs_.h_view(nmode) = 0.0;
+                ysss_.h_view(nmode) = 0.0;
+
+                xccc_.h_view(nmode) = 0.0;
+                xscc_.h_view(nmode) = 0.0;
+                xcsc_.h_view(nmode) = 0.0;
+                xssc_.h_view(nmode) = 0.0;
+                xccs_.h_view(nmode) = 0.0;
+                xscs_.h_view(nmode) = 0.0;
+                xcss_.h_view(nmode) = 0.0;
+                xsss_.h_view(nmode) = 0.0;
+              }
+            } else if (driving_type == 1) {
+              kprl = sqrt(SQR(kx));
+              kprp = sqrt(SQR(ky) + SQR(kz));
+              if (kprl > 1e-16 && kprp > 1e-16) {
+                norm = 1.0/pow(kprp,(ex_prp+1.0)/2.0)/pow(kprl,ex_prl/2.0);
+              } else {
+                norm = 0.0;
+              }
+
+              if (nky != 0) {
+                iky = 1.0/(dky*((Real) nky));
+
+                xccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xccs_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xcsc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xcss_.h_view(nmode) = RanGaussianSt(&(rstate));
+                xscc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+                xscs_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+                xssc_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+                xsss_.h_view(nmode) = (nkx==0) ? 0.0 : RanGaussianSt(&(rstate));
+
+                yccc_.h_view(nmode) =  iky*(kx*xssc_.h_view(nmode));
+                yccs_.h_view(nmode) =  iky*(kx*xsss_.h_view(nmode));
+                ycsc_.h_view(nmode) = -iky*(kx*xscc_.h_view(nmode));
+                ycss_.h_view(nmode) = -iky*(kx*xscs_.h_view(nmode));
+                yscc_.h_view(nmode) = -iky*(kx*xcsc_.h_view(nmode));
+                yscs_.h_view(nmode) = -iky*(kx*xcss_.h_view(nmode));
+                yssc_.h_view(nmode) =  iky*(kx*xccc_.h_view(nmode));
+                ysss_.h_view(nmode) =  iky*(kx*xccs_.h_view(nmode));
+
+                zccc_.h_view(nmode) = 0.0;
+                zccs_.h_view(nmode) = 0.0;
+                zcsc_.h_view(nmode) = 0.0;
+                zcss_.h_view(nmode) = 0.0;
+                zscc_.h_view(nmode) = 0.0;
+                zscs_.h_view(nmode) = 0.0;
+                zssc_.h_view(nmode) = 0.0;
+                zsss_.h_view(nmode) = 0.0;
+              } else {
+                yccc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                yscc_.h_view(nmode) = RanGaussianSt(&(rstate));
+                ycsc_.h_view(nmode) = 0.0;
+                yssc_.h_view(nmode) = 0.0;
+                yccs_.h_view(nmode) = 0.0;
+                ycss_.h_view(nmode) = 0.0;
+                yscs_.h_view(nmode) = 0.0;
+                ysss_.h_view(nmode) = 0.0;
+
+                xccc_.h_view(nmode) = 0.0;
+                xscc_.h_view(nmode) = 0.0;
+                xcsc_.h_view(nmode) = 0.0;
+                xssc_.h_view(nmode) = 0.0;
+                xccs_.h_view(nmode) = 0.0;
+                xscs_.h_view(nmode) = 0.0;
+                xcss_.h_view(nmode) = 0.0;
+                xsss_.h_view(nmode) = 0.0;
+
+                zccc_.h_view(nmode) = 0.0;
+                zscc_.h_view(nmode) = 0.0;
+                zcsc_.h_view(nmode) = 0.0;
+                zssc_.h_view(nmode) = 0.0;
+                zccs_.h_view(nmode) = 0.0;
+                zcss_.h_view(nmode) = 0.0;
+                zscs_.h_view(nmode) = 0.0;
+                zsss_.h_view(nmode) = 0.0;
+              }
+            }
+            xccc_.h_view(nmode) *= norm;
+            xscc_.h_view(nmode) *= norm;
+            xcsc_.h_view(nmode) *= norm;
+            xssc_.h_view(nmode) *= norm;
+            xccs_.h_view(nmode) *= norm;
+            xscs_.h_view(nmode) *= norm;
+            xcss_.h_view(nmode) *= norm;
+            xsss_.h_view(nmode) *= norm;
+            yccc_.h_view(nmode) *= norm;
+            yscc_.h_view(nmode) *= norm;
+            ycsc_.h_view(nmode) *= norm;
+            yssc_.h_view(nmode) *= norm;
+            yccs_.h_view(nmode) *= norm;
+            yscs_.h_view(nmode) *= norm;
+            ycss_.h_view(nmode) *= norm;
+            ysss_.h_view(nmode) *= norm;
+            zccc_.h_view(nmode) *= norm;
+            zscc_.h_view(nmode) *= norm;
+            zcsc_.h_view(nmode) *= norm;
+            zssc_.h_view(nmode) *= norm;
+            zccs_.h_view(nmode) *= norm;
+            zscs_.h_view(nmode) *= norm;
+            zcss_.h_view(nmode) *= norm;
+            zsss_.h_view(nmode) *= norm;
+
+            nmode++;
+          }
+        }
+      }
     }
-  } else {
-    Real tforce = 0.0;
-    Kokkos::parallel_reduce("force_rms", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
-    KOKKOS_LAMBDA(const int &idx, Real &sum_tf) {
+
+    xccc_.template modify<HostMemSpace>();
+    xccc_.template sync<DevExeSpace>();
+    xccs_.template modify<HostMemSpace>();
+    xccs_.template sync<DevExeSpace>();
+    xcsc_.template modify<HostMemSpace>();
+    xcsc_.template sync<DevExeSpace>();
+    xcss_.template modify<HostMemSpace>();
+    xcss_.template sync<DevExeSpace>();
+    xscc_.template modify<HostMemSpace>();
+    xscc_.template sync<DevExeSpace>();
+    xscs_.template modify<HostMemSpace>();
+    xscs_.template sync<DevExeSpace>();
+    xssc_.template modify<HostMemSpace>();
+    xssc_.template sync<DevExeSpace>();
+    xsss_.template modify<HostMemSpace>();
+    xsss_.template sync<DevExeSpace>();
+
+    yccc_.template modify<HostMemSpace>();
+    yccc_.template sync<DevExeSpace>();
+    yccs_.template modify<HostMemSpace>();
+    yccs_.template sync<DevExeSpace>();
+    ycsc_.template modify<HostMemSpace>();
+    ycsc_.template sync<DevExeSpace>();
+    ycss_.template modify<HostMemSpace>();
+    ycss_.template sync<DevExeSpace>();
+    yscc_.template modify<HostMemSpace>();
+    yscc_.template sync<DevExeSpace>();
+    yscs_.template modify<HostMemSpace>();
+    yscs_.template sync<DevExeSpace>();
+    yssc_.template modify<HostMemSpace>();
+    yssc_.template sync<DevExeSpace>();
+    ysss_.template modify<HostMemSpace>();
+    ysss_.template sync<DevExeSpace>();
+
+    zccc_.template modify<HostMemSpace>();
+    zccc_.template sync<DevExeSpace>();
+    zccs_.template modify<HostMemSpace>();
+    zccs_.template sync<DevExeSpace>();
+    zcsc_.template modify<HostMemSpace>();
+    zcsc_.template sync<DevExeSpace>();
+    zcss_.template modify<HostMemSpace>();
+    zcss_.template sync<DevExeSpace>();
+    zscc_.template modify<HostMemSpace>();
+    zscc_.template sync<DevExeSpace>();
+    zscs_.template modify<HostMemSpace>();
+    zscs_.template sync<DevExeSpace>();
+    zssc_.template modify<HostMemSpace>();
+    zssc_.template sync<DevExeSpace>();
+    zsss_.template modify<HostMemSpace>();
+    zsss_.template sync<DevExeSpace>();
+
+    auto xcos_ = xcos;
+    auto xsin_ = xsin;
+    auto ycos_ = ycos;
+    auto ysin_ = ysin;
+    auto zcos_ = zcos;
+    auto zsin_ = zsin;
+
+    for (int n=0; n<mode_count_; n++) {
+      par_for("force_compute", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        force_tmp_(m,0,k,j,i) += xccc_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,0,k,j,i) += xccs_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,0,k,j,i) += xcsc_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,0,k,j,i) += xcss_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,0,k,j,i) += xscc_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,0,k,j,i) += xscs_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,0,k,j,i) += xssc_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,0,k,j,i) += xsss_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
+
+        force_tmp_(m,1,k,j,i) += yccc_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,1,k,j,i) += yccs_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,1,k,j,i) += ycsc_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,1,k,j,i) += ycss_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,1,k,j,i) += yscc_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,1,k,j,i) += yscs_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,1,k,j,i) += yssc_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,1,k,j,i) += ysss_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
+
+        force_tmp_(m,2,k,j,i) += zccc_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,2,k,j,i) += zccs_.d_view(n)*xcos_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,2,k,j,i) += zcsc_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,2,k,j,i) += zcss_.d_view(n)*xcos_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,2,k,j,i) += zscc_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,2,k,j,i) += zscs_.d_view(n)*xsin_(m,n,i)*ycos_(m,n,j)*zsin_(m,n,k);
+        force_tmp_(m,2,k,j,i) += zssc_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zcos_(m,n,k);
+        force_tmp_(m,2,k,j,i) += zsss_.d_view(n)*xsin_(m,n,i)*ysin_(m,n,j)*zsin_(m,n,k);
+      });
+    }
+
+    DvceArray5D<Real> u0, u0_;
+    if (pmy_pack->phydro != nullptr) u0 = (pmy_pack->phydro->u0);
+    if (pmy_pack->pmhd != nullptr) u0 = (pmy_pack->pmhd->u0);
+    bool flag_twofl = false;
+    if (pmy_pack->pionn != nullptr) {
+      u0 = (pmy_pack->phydro->u0);
+      u0_ = (pmy_pack->pmhd->u0);
+      flag_twofl = true;
+    }
+
+    const int nmkji = nmb*nx3*nx2*nx1;
+    const int nkji = nx3*nx2*nx1;
+    const int nji  = nx2*nx1;
+    Real t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+
+    Kokkos::parallel_reduce("net_mom_1", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+    KOKKOS_LAMBDA(const int &idx, Real &sum_t0, Real &sum_t1,
+                                  Real &sum_t2, Real &sum_t3) {
       int m = (idx)/nkji;
       int k = (idx - m*nkji)/nji;
       int j = (idx - m*nkji - k*nji)/nx1;
       int i = (idx - m*nkji - k*nji - j*nx1) + is;
       k += ks;
       j += js;
+      Real den = u0(m,IDN,k,j,i);
+      if (flag_twofl) {
+        den += u0_(m,IDN,k,j,i);
+      }
+      sum_t0 += den;
+      sum_t1 += den*force_tmp_(m,0,k,j,i);
+      sum_t2 += den*force_tmp_(m,1,k,j,i);
+      sum_t3 += den*force_tmp_(m,2,k,j,i);
+    }, Kokkos::Sum<Real>(t0), Kokkos::Sum<Real>(t1),
+       Kokkos::Sum<Real>(t2), Kokkos::Sum<Real>(t3));
+
+
+#if MPI_PARALLEL_ENABLED
+    Real m_loc[4], gm[4];
+    m_loc[0] = t0; m_loc[1] = t1; m_loc[2] = t2; m_loc[3] = t3;
+    MPI_Allreduce(m_loc, gm, 4, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    t0 = gm[0]; t1 = gm[1]; t2 = gm[2]; t3 = gm[3];
+#endif
+
+    par_for("force_remove_net_mom", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      force_tmp_(m,0,k,j,i) -= t1/t0;
+      force_tmp_(m,1,k,j,i) -= t2/t0;
+      force_tmp_(m,2,k,j,i) -= t3/t0;
+    });
+
+    t0 = 0.0;
+    t1 = 0.0;
+    Kokkos::parallel_reduce("net_mom_2", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+    KOKKOS_LAMBDA(const int &idx, Real &sum_t0, Real &sum_t1) {
+      int m = (idx)/nkji;
+      int k = (idx - m*nkji)/nji;
+      int j = (idx - m*nkji - k*nji)/nx1;
+      int i = (idx - m*nkji - k*nji - j*nx1) + is;
+      k += ks;
+      j += js;
+
+      Real den  = u0(m,IDN,k,j,i);
+      Real mom1 = u0(m,IM1,k,j,i);
+      Real mom2 = u0(m,IM2,k,j,i);
+      Real mom3 = u0(m,IM3,k,j,i);
+      if (flag_twofl) {
+        den  += u0_(m,IDN,k,j,i);
+        mom1 += u0_(m,IM1,k,j,i);
+        mom2 += u0_(m,IM2,k,j,i);
+        mom3 += u0_(m,IM3,k,j,i);
+      }
       Real v1 = force_tmp_(m,0,k,j,i);
       Real v2 = force_tmp_(m,1,k,j,i);
       Real v3 = force_tmp_(m,2,k,j,i);
-      sum_tf += v1*v1 + v2*v2 + v3*v3;
-    }, Kokkos::Sum<Real>(tforce));
+
+      sum_t0 += den*(v1*v1+v2*v2+v3*v3);
+      sum_t1 += mom1*v1+mom2*v2+mom3*v3;
+    }, Kokkos::Sum<Real>(t0), Kokkos::Sum<Real>(t1));
+
 #if MPI_PARALLEL_ENABLED
-    Real mt[1], gmt[1];
-    mt[0] = tforce;
-    MPI_Allreduce(mt, gmt, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    tforce = gmt[0];
+    Real m_loc2[2], gm2[2];
+    m_loc2[0] = t0; m_loc2[1] = t1;
+    MPI_Allreduce(m_loc2, gm2, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    t0 = gm2[0]; t1 = gm2[1];
 #endif
-    Real frms_sq = tforce*dvol;
-    Real accel_target = std::abs(accel_rms);
-    if (frms_sq > 0.0) {
-      s = accel_target/std::sqrt(frms_sq);
+
+    t0 = std::max(t0, 1.0e-20);
+    t1 = std::max(t1, 1.0e-20);
+
+    Real m0 = t0, m1 = t1;
+    Real dt = pm->dt;
+    auto &gindcs = pm->mesh_indcs;
+    int &gnx1 = gindcs.nx1;
+    int &gnx2 = gindcs.nx2;
+    int &gnx3 = gindcs.nx3;
+    Real dvol = 1.0/(gnx1*gnx2*gnx3);
+    Real s = 1.0;
+    if (control_mode == ForceControl::kPower) {
+      m0 = 0.5*m0*dvol*dt;
+      m1 = m1*dvol;
+      if (m0 != 0.0) {
+        if (m1 >= 0) {
+          s = -m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
+        } else {
+          s = m1/2./m0 + sqrt(m1*m1/4./m0/m0 + dedt/m0);
+        }
+      } else {
+        s = 0.0;
+      }
     } else {
-      s = 0.0;
+      Real tforce = 0.0;
+      Kokkos::parallel_reduce("force_rms", Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+      KOKKOS_LAMBDA(const int &idx, Real &sum_tf) {
+        int m = (idx)/nkji;
+        int k = (idx - m*nkji)/nji;
+        int j = (idx - m*nkji - k*nji)/nx1;
+        int i = (idx - m*nkji - k*nji - j*nx1) + is;
+        k += ks;
+        j += js;
+        Real v1 = force_tmp_(m,0,k,j,i);
+        Real v2 = force_tmp_(m,1,k,j,i);
+        Real v3 = force_tmp_(m,2,k,j,i);
+        sum_tf += v1*v1 + v2*v2 + v3*v3;
+      }, Kokkos::Sum<Real>(tforce));
+#if MPI_PARALLEL_ENABLED
+      Real mt[1], gmt[1];
+      mt[0] = tforce;
+      MPI_Allreduce(mt, gmt, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      tforce = gmt[0];
+#endif
+      Real frms_sq = tforce*dvol;
+      Real accel_target = std::abs(accel_rms);
+      if (frms_sq > 0.0) {
+        s = accel_target/std::sqrt(frms_sq);
+      } else {
+        s = 0.0;
+      }
     }
-  }
-  if (m0 == 0.0) s = 0.0;
+    if (m0 == 0.0) s = 0.0;
 
-  par_for("force_norm", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    force_tmp_(m,0,k,j,i) *= s;
-    force_tmp_(m,1,k,j,i) *= s;
-    force_tmp_(m,2,k,j,i) *= s;
-  });
-
-  if (force_perp_only) {
-    par_for("force_zero_parallel_tmp", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+    par_for("force_norm", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      force_tmp_(m,2,k,j,i) = 0.0;
+      force_tmp_(m,0,k,j,i) *= s;
+      force_tmp_(m,1,k,j,i) *= s;
+      force_tmp_(m,2,k,j,i) *= s;
     });
-  }
 
+    if (force_perp_only) {
+      par_for("force_zero_parallel_tmp", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        force_tmp_(m,2,k,j,i) = 0.0;
+      });
+    }
+  };
+
+  synthesize(force_tmp);
   if (alfvenic_drive) {
-    auto force_plus_tmp_ = force_plus_tmp;
-    auto force_minus_tmp_ = force_minus_tmp;
-    par_for("store_plus_minus_templates", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
-    KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      Real fx = force_tmp_(m,0,k,j,i);
-      Real fy = force_tmp_(m,1,k,j,i);
-      force_plus_tmp_(m,0,k,j,i) = fx;
-      force_plus_tmp_(m,1,k,j,i) = fy;
-      force_plus_tmp_(m,2,k,j,i) = 0.0;
-      force_minus_tmp_(m,0,k,j,i) = -fy;
-      force_minus_tmp_(m,1,k,j,i) =  fx;
-      force_minus_tmp_(m,2,k,j,i) = 0.0;
-    });
+    Kokkos::deep_copy(force_plus_tmp, force_tmp);
+    synthesize(force_minus_tmp);
+  } else {
+    Kokkos::deep_copy(force_plus_tmp, force_tmp);
+    Kokkos::deep_copy(force_minus_tmp, 0.0);
   }
 
   return TaskStatus::complete;
@@ -1115,6 +1489,7 @@ TaskStatus TurbulenceDriver::AddForcing(Driver *pdrive, int stage) {
   int &nx3 = indcs.nx3;
 
   Real dt = pm->dt;
+  Real beta_dt = (pdrive->beta[stage-1])*(pm->dt);
   Real fcorr, gcorr;
   if (tcorr <= 1e-6) {  // use whitenoise
     fcorr = 0.0;
@@ -1158,36 +1533,152 @@ TaskStatus TurbulenceDriver::AddForcing(Driver *pdrive, int stage) {
   auto force_tmp_ = force_tmp;
   auto bdrive_ = bdrive;
   if (need_alfvenic) {
-    auto force_plus_ = force_plus;
-    auto force_minus_ = force_minus;
-    auto force_plus_tmp_ = force_plus_tmp;
-    auto force_minus_tmp_ = force_minus_tmp;
+    auto ppc0 = xccc; auto ppc1 = xccs; auto ppc2 = xcsc; auto ppc3 = xcss;
+    auto ppc4 = xscc; auto ppc5 = xscs; auto ppc6 = xssc; auto ppc7 = xsss;
+    auto pmc0 = yccc; auto pmc1 = yccs; auto pmc2 = ycsc; auto pmc3 = ycss;
+    auto pmc4 = yscc; auto pmc5 = yscs; auto pmc6 = yssc; auto pmc7 = ysss;
+    auto tpc0 = zccc; auto tpc1 = zccs; auto tpc2 = zcsc; auto tpc3 = zcss;
+    auto tpc4 = zscc; auto tpc5 = zscs; auto tpc6 = zssc; auto tpc7 = zsss;
+    auto tmc0 = psiccc; auto tmc1 = psiccs; auto tmc2 = psicsc; auto tmc3 = psicss;
+    auto tmc4 = psiscc; auto tmc5 = psiscs; auto tmc6 = psissc; auto tmc7 = psisss;
 
-    par_for("force_OU_elsasser",DevExeSpace(),0,nmb-1,0,2,ks,ke,js,je,is,ie,
-    KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
-      force_plus_(m,n,k,j,i)  = fcorr*force_plus_(m,n,k,j,i)
-                              + gcorr*force_plus_tmp_(m,n,k,j,i);
-      force_minus_(m,n,k,j,i) = fcorr*force_minus_(m,n,k,j,i)
-                              + gcorr*force_minus_tmp_(m,n,k,j,i);
+    int mode_count_ = mode_count;
+    par_for("phi_OU_elsasser", DevExeSpace(),0,mode_count_-1,
+    KOKKOS_LAMBDA(int n) {
+      ppc0.d_view(n) = fcorr*ppc0.d_view(n) + gcorr*tpc0.d_view(n);
+      ppc1.d_view(n) = fcorr*ppc1.d_view(n) + gcorr*tpc1.d_view(n);
+      ppc2.d_view(n) = fcorr*ppc2.d_view(n) + gcorr*tpc2.d_view(n);
+      ppc3.d_view(n) = fcorr*ppc3.d_view(n) + gcorr*tpc3.d_view(n);
+      ppc4.d_view(n) = fcorr*ppc4.d_view(n) + gcorr*tpc4.d_view(n);
+      ppc5.d_view(n) = fcorr*ppc5.d_view(n) + gcorr*tpc5.d_view(n);
+      ppc6.d_view(n) = fcorr*ppc6.d_view(n) + gcorr*tpc6.d_view(n);
+      ppc7.d_view(n) = fcorr*ppc7.d_view(n) + gcorr*tpc7.d_view(n);
+
+      pmc0.d_view(n) = fcorr*pmc0.d_view(n) + gcorr*tmc0.d_view(n);
+      pmc1.d_view(n) = fcorr*pmc1.d_view(n) + gcorr*tmc1.d_view(n);
+      pmc2.d_view(n) = fcorr*pmc2.d_view(n) + gcorr*tmc2.d_view(n);
+      pmc3.d_view(n) = fcorr*pmc3.d_view(n) + gcorr*tmc3.d_view(n);
+      pmc4.d_view(n) = fcorr*pmc4.d_view(n) + gcorr*tmc4.d_view(n);
+      pmc5.d_view(n) = fcorr*pmc5.d_view(n) + gcorr*tmc5.d_view(n);
+      pmc6.d_view(n) = fcorr*pmc6.d_view(n) + gcorr*tmc6.d_view(n);
+      pmc7.d_view(n) = fcorr*pmc7.d_view(n) + gcorr*tmc7.d_view(n);
     });
 
-    par_for("force_from_zpm",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+    auto xcos_ = xcos;
+    auto xsin_ = xsin;
+    auto ycos_ = ycos;
+    auto ysin_ = ysin;
+    auto zcos_ = zcos;
+    auto zsin_ = zsin;
+    auto kx_mode_ = kx_mode;
+    auto ky_mode_ = ky_mode;
+    auto e1 = emf_drive.x1e;
+    auto e2 = emf_drive.x2e;
+    auto e3 = emf_drive.x3e;
+    par_for("phi_emf_zero_x1", DevExeSpace(),0,nmb-1,0,indcs.nx3+2*indcs.ng,
+            0,indcs.nx2+2*indcs.ng,0,indcs.nx1+2*indcs.ng-1,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) { e1(m,k,j,i) = 0.0; });
+    par_for("phi_emf_zero_x2", DevExeSpace(),0,nmb-1,0,indcs.nx3+2*indcs.ng,
+            0,indcs.nx2+2*indcs.ng-1,0,indcs.nx1+2*indcs.ng,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) { e2(m,k,j,i) = 0.0; });
+    par_for("phi_emf_zero_x3", DevExeSpace(),0,nmb-1,0,indcs.nx3+2*indcs.ng-1,
+            0,indcs.nx2+2*indcs.ng,0,indcs.nx1+2*indcs.ng,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) { e3(m,k,j,i) = 0.0; });
+
+    par_for("force_from_phi_coeff",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      Real zp_x = force_plus_(m,0,k,j,i);
-      Real zp_y = force_plus_(m,1,k,j,i);
-      Real zm_x = force_minus_(m,0,k,j,i);
-      Real zm_y = force_minus_(m,1,k,j,i);
-      Real v_fac = 0.5;
-      Real b_fac = 0.5*sqrt_rho0;
-      Real v1 = v_fac*(w_plus*zp_x + w_minus*zm_x);
-      Real v2 = v_fac*(w_plus*zp_y + w_minus*zm_y);
-      force_(m,0,k,j,i) = v1;
-      force_(m,1,k,j,i) = v2;
+      Real vp1 = 0.0, vp2 = 0.0;
+      Real vm1 = 0.0, vm2 = 0.0;
+      for (int n=0; n<mode_count_; ++n) {
+        Real xc = xcos_(m,n,i);
+        Real xs = xsin_(m,n,i);
+        Real yc = ycos_(m,n,j);
+        Real ys = ysin_(m,n,j);
+        Real zc = zcos_(m,n,k);
+        Real zs = zsin_(m,n,k);
+        Real kx = kx_mode_.d_view(n);
+        Real ky = ky_mode_.d_view(n);
+
+        vp1 += (-ky)*ppc0.d_view(n)*xc*ys*zc;
+        vp1 += (-ky)*ppc1.d_view(n)*xc*ys*zs;
+        vp1 += ( ky)*ppc2.d_view(n)*xc*yc*zc;
+        vp1 += ( ky)*ppc3.d_view(n)*xc*yc*zs;
+        vp1 += (-ky)*ppc4.d_view(n)*xs*ys*zc;
+        vp1 += (-ky)*ppc5.d_view(n)*xs*ys*zs;
+        vp1 += ( ky)*ppc6.d_view(n)*xs*yc*zc;
+        vp1 += ( ky)*ppc7.d_view(n)*xs*yc*zs;
+
+        vp2 += ( kx)*ppc0.d_view(n)*xs*yc*zc;
+        vp2 += ( kx)*ppc1.d_view(n)*xs*yc*zs;
+        vp2 += ( kx)*ppc2.d_view(n)*xs*ys*zc;
+        vp2 += ( kx)*ppc3.d_view(n)*xs*ys*zs;
+        vp2 += (-kx)*ppc4.d_view(n)*xc*yc*zc;
+        vp2 += (-kx)*ppc5.d_view(n)*xc*yc*zs;
+        vp2 += (-kx)*ppc6.d_view(n)*xc*ys*zc;
+        vp2 += (-kx)*ppc7.d_view(n)*xc*ys*zs;
+
+        vm1 += (-ky)*pmc0.d_view(n)*xc*ys*zc;
+        vm1 += (-ky)*pmc1.d_view(n)*xc*ys*zs;
+        vm1 += ( ky)*pmc2.d_view(n)*xc*yc*zc;
+        vm1 += ( ky)*pmc3.d_view(n)*xc*yc*zs;
+        vm1 += (-ky)*pmc4.d_view(n)*xs*ys*zc;
+        vm1 += (-ky)*pmc5.d_view(n)*xs*ys*zs;
+        vm1 += ( ky)*pmc6.d_view(n)*xs*yc*zc;
+        vm1 += ( ky)*pmc7.d_view(n)*xs*yc*zs;
+
+        vm2 += ( kx)*pmc0.d_view(n)*xs*yc*zc;
+        vm2 += ( kx)*pmc1.d_view(n)*xs*yc*zs;
+        vm2 += ( kx)*pmc2.d_view(n)*xs*ys*zc;
+        vm2 += ( kx)*pmc3.d_view(n)*xs*ys*zs;
+        vm2 += (-kx)*pmc4.d_view(n)*xc*yc*zc;
+        vm2 += (-kx)*pmc5.d_view(n)*xc*yc*zs;
+        vm2 += (-kx)*pmc6.d_view(n)*xc*ys*zc;
+        vm2 += (-kx)*pmc7.d_view(n)*xc*ys*zs;
+      }
+
+      force_(m,0,k,j,i) = 0.5*(w_plus*vp1 + w_minus*vm1);
+      force_(m,1,k,j,i) = 0.5*(w_plus*vp2 + w_minus*vm2);
       force_(m,2,k,j,i) = 0.0;
-      bdrive_(m,0,k,j,i) = b_fac*(w_plus*zp_x - w_minus*zm_x);
-      bdrive_(m,1,k,j,i) = b_fac*(w_plus*zp_y - w_minus*zm_y);
+      bdrive_(m,0,k,j,i) = 0.5*sqrt_rho0*(w_plus*vp1 - w_minus*vm1);
+      bdrive_(m,1,k,j,i) = 0.5*sqrt_rho0*(w_plus*vp2 - w_minus*vm2);
     });
-    ComputeMagneticEMF();
+
+    auto xcos_edge_ = xcos_edge;
+    auto xsin_edge_ = xsin_edge;
+    auto ycos_edge_ = ycos_edge;
+    auto ysin_edge_ = ysin_edge;
+    par_for("emf_from_phi_coeff", DevExeSpace(),0,nmb-1,ks,ke,js,je+1,is,ie+1,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real phip = 0.0, phim = 0.0;
+      for (int n=0; n<mode_count_; ++n) {
+        Real xc = xcos_edge_(m,n,i);
+        Real xs = xsin_edge_(m,n,i);
+        Real yc = ycos_edge_(m,n,j);
+        Real ys = ysin_edge_(m,n,j);
+        Real zc = zcos_(m,n,k);
+        Real zs = zsin_(m,n,k);
+
+        phip += ppc0.d_view(n)*xc*yc*zc;
+        phip += ppc1.d_view(n)*xc*yc*zs;
+        phip += ppc2.d_view(n)*xc*ys*zc;
+        phip += ppc3.d_view(n)*xc*ys*zs;
+        phip += ppc4.d_view(n)*xs*yc*zc;
+        phip += ppc5.d_view(n)*xs*yc*zs;
+        phip += ppc6.d_view(n)*xs*ys*zc;
+        phip += ppc7.d_view(n)*xs*ys*zs;
+
+        phim += pmc0.d_view(n)*xc*yc*zc;
+        phim += pmc1.d_view(n)*xc*yc*zs;
+        phim += pmc2.d_view(n)*xc*ys*zc;
+        phim += pmc3.d_view(n)*xc*ys*zs;
+        phim += pmc4.d_view(n)*xs*yc*zc;
+        phim += pmc5.d_view(n)*xs*yc*zs;
+        phim += pmc6.d_view(n)*xs*ys*zc;
+        phim += pmc7.d_view(n)*xs*ys*zs;
+      }
+      e3(m,k,j,i) = -0.5*sqrt_rho0*(w_plus*phip - w_minus*phim);
+    });
+    emf_ready_ = true;
   } else {
     par_for("force_OU_process",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -1227,17 +1718,17 @@ TaskStatus TurbulenceDriver::AddForcing(Driver *pdrive, int stage) {
 
       Real Fv = (v1*ux + v2*uy + v3*uz)/ut;
 
-      u0(m,IEN,k,j,i) += Fv*den*dt;
+      u0(m,IEN,k,j,i) += Fv*den*beta_dt;
     }
-    u0(m,IM1,k,j,i) += den*v1*dt;
-    u0(m,IM2,k,j,i) += den*v2*dt;
-    u0(m,IM3,k,j,i) += den*v3*dt;
+    u0(m,IM1,k,j,i) += den*v1*beta_dt;
+    u0(m,IM2,k,j,i) += den*v2*beta_dt;
+    u0(m,IM3,k,j,i) += den*v3*beta_dt;
 
     if (flag_twofl) {
       den = u0_(m,IDN,k,j,i);
-      u0_(m,IM1,k,j,i) += den*v1*dt;
-      u0_(m,IM2,k,j,i) += den*v2*dt;
-      u0_(m,IM3,k,j,i) += den*v3*dt;
+      u0_(m,IM1,k,j,i) += den*v1*beta_dt;
+      u0_(m,IM2,k,j,i) += den*v2*beta_dt;
+      u0_(m,IM3,k,j,i) += den*v3*beta_dt;
     }
   });
 
@@ -1786,14 +2277,14 @@ void TurbulenceDriver::ComputeMagneticEMF() {
       return (a.first*a.second + b.first*b.second)/denom;
     };
 
-    psiccc.h_view(n) = blend(from_by(cy_scc,  1.0), from_bx(cx_csc, -1.0));
-    psiccs.h_view(n) = blend(from_by(cy_scs,  1.0), from_bx(cx_css, -1.0));
-    psicsc.h_view(n) = blend(from_by(cy_ssc,  1.0), from_bx(cx_ccc,  1.0));
-    psicss.h_view(n) = blend(from_by(cy_sss,  1.0), from_bx(cx_ccs,  1.0));
-    psiscc.h_view(n) = blend(from_by(cy_ccc, -1.0), from_bx(cx_ssc, -1.0));
-    psiscs.h_view(n) = blend(from_by(cy_ccs, -1.0), from_bx(cx_sss, -1.0));
-    psissc.h_view(n) = blend(from_by(cy_csc, -1.0), from_bx(cx_scc,  1.0));
-    psisss.h_view(n) = blend(from_by(cy_css, -1.0), from_bx(cx_scs,  1.0));
+    psiccc.h_view(n) = blend(from_by(cy_scc, -1.0), from_bx(cx_csc,  1.0));
+    psiccs.h_view(n) = blend(from_by(cy_scs, -1.0), from_bx(cx_css,  1.0));
+    psicsc.h_view(n) = blend(from_by(cy_ssc, -1.0), from_bx(cx_ccc, -1.0));
+    psicss.h_view(n) = blend(from_by(cy_sss, -1.0), from_bx(cx_ccs, -1.0));
+    psiscc.h_view(n) = blend(from_by(cy_ccc,  1.0), from_bx(cx_ssc,  1.0));
+    psiscs.h_view(n) = blend(from_by(cy_ccs,  1.0), from_bx(cx_sss,  1.0));
+    psissc.h_view(n) = blend(from_by(cy_csc,  1.0), from_bx(cx_scc, -1.0));
+    psisss.h_view(n) = blend(from_by(cy_css,  1.0), from_bx(cx_scs, -1.0));
   }
 
   psiccc.template sync<DevExeSpace>();
@@ -1805,11 +2296,6 @@ void TurbulenceDriver::ComputeMagneticEMF() {
   psissc.template sync<DevExeSpace>();
   psisss.template sync<DevExeSpace>();
 
-  auto xcos_edge_ = xcos_edge;
-  auto xsin_edge_ = xsin_edge;
-  auto ycos_edge_ = ycos_edge;
-  auto ysin_edge_ = ysin_edge;
-  auto e3 = emf_drive.x3e;
   auto psiccc_ = psiccc;
   auto psiccs_ = psiccs;
   auto psicsc_ = psicsc;
@@ -1818,6 +2304,94 @@ void TurbulenceDriver::ComputeMagneticEMF() {
   auto psiscs_ = psiscs;
   auto psissc_ = psissc;
   auto psisss_ = psisss;
+
+  // Match projected magnetic driving amplitude to the input bdrive field.
+  const int nx1 = ie - is + 1;
+  const int nx2 = je - js + 1;
+  const int nx3 = ke - ks + 1;
+  const int nmkji = nmb*nx3*nx2*nx1;
+  const int nkji = nx3*nx2*nx1;
+  const int nji = nx2*nx1;
+  Real proj_dot = 0.0;
+  Real proj_sq = 0.0;
+  auto kx_mode_ = kx_mode;
+  auto ky_mode_ = ky_mode;
+  Kokkos::parallel_reduce("project_bdrive_scale",
+  Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+  KOKKOS_LAMBDA(const int &idx, Real &sum_dot, Real &sum_sq) {
+    int m = (idx)/nkji;
+    int k = (idx - m*nkji)/nji;
+    int j = (idx - m*nkji - k*nji)/nx1;
+    int i = (idx - m*nkji - k*nji - j*nx1) + is;
+    k += ks;
+    j += js;
+    Real bx = 0.0;
+    Real by = 0.0;
+    for (int n=0; n<mode_count_; ++n) {
+      Real xc = xcos_(m,n,i);
+      Real xs = xsin_(m,n,i);
+      Real yc = ycos_(m,n,j);
+      Real ys = ysin_(m,n,j);
+      Real zc = zcos_(m,n,k);
+      Real zs = zsin_(m,n,k);
+      Real kx = kx_mode_.d_view(n);
+      Real ky = ky_mode_.d_view(n);
+
+      bx += ( ky)*psiccc_.d_view(n)*xc*ys*zc;
+      bx += ( ky)*psiccs_.d_view(n)*xc*ys*zs;
+      bx += (-ky)*psicsc_.d_view(n)*xc*yc*zc;
+      bx += (-ky)*psicss_.d_view(n)*xc*yc*zs;
+      bx += ( ky)*psiscc_.d_view(n)*xs*ys*zc;
+      bx += ( ky)*psiscs_.d_view(n)*xs*ys*zs;
+      bx += (-ky)*psissc_.d_view(n)*xs*yc*zc;
+      bx += (-ky)*psisss_.d_view(n)*xs*yc*zs;
+
+      by += (-kx)*psiccc_.d_view(n)*xs*yc*zc;
+      by += (-kx)*psiccs_.d_view(n)*xs*yc*zs;
+      by += (-kx)*psicsc_.d_view(n)*xs*ys*zc;
+      by += (-kx)*psicss_.d_view(n)*xs*ys*zs;
+      by += ( kx)*psiscc_.d_view(n)*xc*yc*zc;
+      by += ( kx)*psiscs_.d_view(n)*xc*yc*zs;
+      by += ( kx)*psissc_.d_view(n)*xc*ys*zc;
+      by += ( kx)*psisss_.d_view(n)*xc*ys*zs;
+    }
+
+    Real bxin = bdrive_(m,0,k,j,i);
+    Real byin = bdrive_(m,1,k,j,i);
+    sum_dot += bxin*bx + byin*by;
+    sum_sq += bx*bx + by*by;
+  }, Kokkos::Sum<Real>(proj_dot), Kokkos::Sum<Real>(proj_sq));
+
+#if MPI_PARALLEL_ENABLED
+  Real mscale[2] = {proj_dot, proj_sq};
+  Real gscale[2] = {0.0, 0.0};
+  MPI_Allreduce(mscale, gscale, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  proj_dot = gscale[0];
+  proj_sq = gscale[1];
+#endif
+
+  if (proj_sq > 1.0e-30) {
+    Real scale = proj_dot/proj_sq;
+    if (std::abs(scale - 1.0) > 1.0e-12) {
+      par_for("scale_projected_psi", DevExeSpace(),0,mode_count_-1,
+      KOKKOS_LAMBDA(int n) {
+        psiccc_.d_view(n) *= scale;
+        psiccs_.d_view(n) *= scale;
+        psicsc_.d_view(n) *= scale;
+        psicss_.d_view(n) *= scale;
+        psiscc_.d_view(n) *= scale;
+        psiscs_.d_view(n) *= scale;
+        psissc_.d_view(n) *= scale;
+        psisss_.d_view(n) *= scale;
+      });
+    }
+  }
+
+  auto xcos_edge_ = xcos_edge;
+  auto xsin_edge_ = xsin_edge;
+  auto ycos_edge_ = ycos_edge;
+  auto ysin_edge_ = ysin_edge;
+  auto e3 = emf_drive.x3e;
   par_for("build_emf_z", DevExeSpace(),0,nmb-1,ks,ke,js,je+1,is,ie+1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     Real sum = 0.0;
@@ -1839,6 +2413,41 @@ void TurbulenceDriver::ComputeMagneticEMF() {
       sum += psisss_.d_view(n)*xs*ys*zs;
     }
     e3(m,k,j,i) += sum;
+  });
+  par_for("rebuild_bdrive_filtered", DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    Real bx = 0.0;
+    Real by = 0.0;
+    for (int n=0; n<mode_count_; ++n) {
+      Real xc = xcos_(m,n,i);
+      Real xs = xsin_(m,n,i);
+      Real yc = ycos_(m,n,j);
+      Real ys = ysin_(m,n,j);
+      Real zc = zcos_(m,n,k);
+      Real zs = zsin_(m,n,k);
+      Real kx = kx_mode_.d_view(n);
+      Real ky = ky_mode_.d_view(n);
+
+      bx += ( ky)*psiccc_.d_view(n)*xc*ys*zc;
+      bx += ( ky)*psiccs_.d_view(n)*xc*ys*zs;
+      bx += (-ky)*psicsc_.d_view(n)*xc*yc*zc;
+      bx += (-ky)*psicss_.d_view(n)*xc*yc*zs;
+      bx += ( ky)*psiscc_.d_view(n)*xs*ys*zc;
+      bx += ( ky)*psiscs_.d_view(n)*xs*ys*zs;
+      bx += (-ky)*psissc_.d_view(n)*xs*yc*zc;
+      bx += (-ky)*psisss_.d_view(n)*xs*yc*zs;
+
+      by += (-kx)*psiccc_.d_view(n)*xs*yc*zc;
+      by += (-kx)*psiccs_.d_view(n)*xs*yc*zs;
+      by += (-kx)*psicsc_.d_view(n)*xs*ys*zc;
+      by += (-kx)*psicss_.d_view(n)*xs*ys*zs;
+      by += ( kx)*psiscc_.d_view(n)*xc*yc*zc;
+      by += ( kx)*psiscs_.d_view(n)*xc*yc*zs;
+      by += ( kx)*psissc_.d_view(n)*xc*ys*zc;
+      by += ( kx)*psisss_.d_view(n)*xc*ys*zs;
+    }
+    bdrive_(m,0,k,j,i) = bx;
+    bdrive_(m,1,k,j,i) = by;
   });
 
   emf_ready_ = true;
