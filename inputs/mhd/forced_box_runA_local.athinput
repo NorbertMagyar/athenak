@@ -4,17 +4,17 @@
 problem = mhd_forced_box run A (homogeneous density)
 
 <job>
-basename = local_128
+basename = 1024_d1-3_dp
 
 <mesh>
 nghost = 2
-nx1    = 128
+nx1    = 1024
 x1min  = 0.0
 x1max  = 1.0
 ix1_bc = periodic
 ox1_bc = periodic
 
-nx2    = 128
+nx2    = 1024
 x2min  = 0.0
 x2max  = 1.0
 ix2_bc = periodic
@@ -27,40 +27,40 @@ ix3_bc = periodic
 ox3_bc = periodic
 
 <meshblock>
-nx1 = 16
-nx2 = 16
-nx3 = 16
+nx1 = 128
+nx2 = 128
+nx3 = 128
 
 <time>
 evolution  = dynamic
 integrator = rk2
-cfl_number = 0.5
+cfl_number = 0.75
 nlim       = -1
-tlim       = 10.0
-ndiag      = 1
+tlim       = 0.1
+ndiag      = 10
 
 <mhd>
 eos               = ideal
 gamma             = 1.6666666666667
 reconstruct       = plm
 rsolver           = hlld
-viscosity         = 1.0e-4
-ohmic_resistivity = 1.0e-4
+viscosity         = 1.0e-5
+ohmic_resistivity = 1.0e-5
 
 <problem>
 rho0                = 1.0
-beta                = 0.25
+beta                = 1.0
 p0                  = -1.0   # set automatically from beta and B0 when negative
 B0                  = 1.0
-density_variations  = false
-density_eps         = 0.2
+density_variations  = true
+density_eps         = 0.25
 
 <turb_driving>
 type                = mhd
 nlow                = 1
 nhigh               = 2
 tcorr               = 0.5
-dedt                = 0.0005
+dedt                = 0.001
 control             = power   # alternative: accel
 accel_rms           = 0.1     # used when control = accel
 solenoidal_fraction = 1.0
@@ -76,7 +76,7 @@ dt          = 0.1
 <output2>
 file_type   = bin
 variable    = mhd_divb
-dt          = 0.5
+dt          = 2.5
 #slice_x2    = 0.0	
 file_number = 0
 
@@ -84,13 +84,21 @@ file_number = 0
 file_type   = bin
 id = w_bcc_full
 variable    = mhd_w_bcc
-dt          = 0.5
+dt          = 0.1
 file_number = 0
 
 <output4>
 file_type   = bin
 id = w_bcc_x3slice
 variable    = mhd_w_bcc
-dt          = 0.05
+dt          = 0.1
 slice_x3    = 0.5
+file_number = 0
+
+<output5>
+file_type   = bin
+id = w_bcc_x2slice
+variable    = mhd_w_bcc
+dt          = 0.1
+slice_x2    = 0.5
 file_number = 0
