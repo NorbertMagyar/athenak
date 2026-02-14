@@ -410,4 +410,4 @@ def plot_slope_timeseries(times, slopes, ylabel="slope dlogE/dlogk", label=None)
 #   -DCMAKE_CXX_COMPILER=/workspace/athenak/kokkos/bin/nvcc_wrapper \
 #   -DPROBLEM=mhd_forced_box
 # cmake --build . -j 24
-CUDA_VISIBLE_DEVICES=0 ./build-h200/src/athena -i inputs/mhd/forced_box_runA_local.athinput -d /workspace/turb
+# CUDA_VISIBLE_DEVICES=0 ./build-h200/src/athena -i inputs/mhd/forced_box_runA_local.athinput -d /workspace/turb
