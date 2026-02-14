@@ -102,7 +102,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
     Real rho = rho0_loc;
     if (vary_loc) {
-      Real modulation = 1.0 + eps_loc*(cos(kx*x) + (has_y ? cos(ky*y) : 0.0));
+      Real modulation = 1.0 - eps_loc*(cos(2*kx*x) + (has_y ? cos(2*ky*y) : 0.0));
       rho = rho0_loc*modulation;
     }
     Real rho_floor = 1.0e-8*rho0_loc;
