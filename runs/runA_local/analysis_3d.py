@@ -13,6 +13,14 @@ import athena_read  # noqa: E402
 DEFAULT_QUANTITIES = ["dens", "velx", "vely", "velz", "bcc1", "bcc2", "bcc3", "eint"]
 
 
+def load_cube(file_path, quantities=None):
+    if quantities is None:
+        quantities = DEFAULT_QUANTITIES
+    cube = athena_read.athdf(file_path, quantities=quantities)
+    time = float(cube.get("Time", 0.0))
+    return cube, time
+
+
 def load_cubes(pattern, quantities=None):
     files = sorted(glob.glob(pattern))
     if not files:
@@ -59,43 +67,84 @@ def fit_power_law(k, ek, kmin=2, kmax=20):
     return np.polyfit(np.log10(k[mask]), np.log10(ek[mask]), 1)[0]
 
 
-def spectra_3d(cube, field="v", subtract_mean=True):
+def _rfft_hermitian_weights(nx):
+    nxh = nx // 2 + 1
+    w = np.ones(nxh, dtype=np.float64)
+    if nx % 2 == 0:
+        if nxh > 2:
+            w[1:-1] = 2.0
+    else:
+        if nxh > 1:
+            w[1:] = 2.0
+    return w
+
+
+def spectra_3d(cube, field="v", subtract_mean=True, work_dtype=np.float64):
     """3D isotropic and reduced spectra from one cube.
 
     AthenaK array ordering is [x3, x2, x1] = [z, y, x].
     For B0 || z: k_parallel = kz, k_perp = sqrt(kx^2 + ky^2).
+    This implementation is memory-leaner than full 3D k-grid construction.
     """
     f1, f2, f3 = _vector_components(cube, field=field)
     nz, ny, nx = f1.shape
     ntot = float(nx * ny * nz)
 
-    if subtract_mean:
-        f1 = f1 - np.mean(f1)
-        f2 = f2 - np.mean(f2)
-        f3 = f3 - np.mean(f3)
-
-    f1h = np.fft.fftn(f1)
-    f2h = np.fft.fftn(f2)
-    f3h = np.fft.fftn(f3)
-    p3d = (np.abs(f1h) ** 2 + np.abs(f2h) ** 2 + np.abs(f3h) ** 2) / ntot**2
-
-    kx = np.fft.fftfreq(nx) * nx
+    kx = np.fft.rfftfreq(nx) * nx
     ky = np.fft.fftfreq(ny) * ny
     kz = np.fft.fftfreq(nz) * nz
-    kz3, ky3, kx3 = np.meshgrid(kz, ky, kx, indexing="ij")
 
-    kmag = np.sqrt(kx3**2 + ky3**2 + kz3**2)
-    kperp = np.sqrt(kx3**2 + ky3**2)
-    kpar = np.abs(kz3)
+    ky2, kx2 = np.meshgrid(ky, kx, indexing="ij")
+    kperp2 = kx2 * kx2 + ky2 * ky2
+    ib_perp_2d = np.rint(np.sqrt(kperp2)).astype(np.int32)
+    kperp_max = int(ib_perp_2d.max())
 
-    w = p3d.ravel()
-    ib_mag = np.rint(kmag).astype(int).ravel()
-    ib_perp = np.rint(kperp).astype(int).ravel()
-    ib_par = np.rint(kpar).astype(int).ravel()
+    kz_abs = np.abs(np.rint(kz)).astype(np.int32)
+    kpar_max = int(kz_abs.max())
+    kmag_max = int(np.ceil(np.sqrt((nx // 2) ** 2 + (ny // 2) ** 2 + (nz // 2) ** 2)))
 
-    ek = np.bincount(ib_mag, weights=w)
-    ek_perp = np.bincount(ib_perp, weights=w)
-    ek_par = np.bincount(ib_par, weights=w)
+    # Precompute 2D isotropic-bin map for each unique |kz| to avoid 3D k-grids.
+    kmag_bins_by_kz = {}
+    for kza in np.unique(kz_abs):
+        kmag_bins_by_kz[int(kza)] = np.rint(np.sqrt(kperp2 + float(kza) ** 2)).astype(np.int32).ravel()
+
+    ek = np.zeros(kmag_max + 1, dtype=np.float64)
+    ek_perp = np.zeros(kperp_max + 1, dtype=np.float64)
+    ek_par = np.zeros(kpar_max + 1, dtype=np.float64)
+
+    hx = _rfft_hermitian_weights(nx)[None, None, :]
+    ib_perp_flat = ib_perp_2d.ravel()
+
+    for comp in (f1, f2, f3):
+        arr = np.asarray(comp, dtype=work_dtype)
+        if subtract_mean:
+            arr = arr - np.mean(arr, dtype=np.float64)
+
+        fh = np.fft.rfftn(arr)
+        p = (fh.real * fh.real + fh.imag * fh.imag) / (ntot * ntot)
+        p *= hx  # compensate half-spectrum along x from rfftn
+
+        # Reduced perp spectrum: sum over z then radial-bin in (kx,ky).
+        p_xy = p.sum(axis=0)
+        ek_perp += np.bincount(
+            ib_perp_flat,
+            weights=p_xy.ravel(),
+            minlength=kperp_max + 1,
+        )
+
+        # Parallel + isotropic spectra: loop over kz planes.
+        for iz in range(nz):
+            kzbin = int(kz_abs[iz])
+            plane = p[iz]
+            plane_sum = float(plane.sum())
+            ek_par[kzbin] += plane_sum
+
+            ib_mag_flat = kmag_bins_by_kz[kzbin]
+            ek += np.bincount(
+                ib_mag_flat,
+                weights=plane.ravel(),
+                minlength=kmag_max + 1,
+            )
 
     return {
         "k": np.arange(ek.size),
@@ -411,3 +460,6 @@ def plot_slope_timeseries(times, slopes, ylabel="slope dlogE/dlogk", label=None)
 #   -DPROBLEM=mhd_forced_box
 # cmake --build . -j 24
 # CUDA_VISIBLE_DEVICES=0 ./build-h200/src/athena -i inputs/mhd/forced_box_runA_local.athinput -d /workspace/turb
+# nohup bash -lc 'cd /workspace/athenak && CUDA_VISIBLE_DEVICES=0 ./build-h200/src/athena -i inputs/mhd/forced_box_runA_local.athinput -d /workspace/turb' \
+#   > /workspace/turb/stdout.log 2>&1 &
+# tail -f /workspace/turb/stdout.log
